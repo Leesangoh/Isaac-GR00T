@@ -17,4 +17,6 @@ uv run python cerebellar_correction/training/train_phase2.py \
     --num_epochs 50 \
     --decode_workers 32 \
     --num_workers 4 \
-    --device cuda
+    --device cuda \
+    --wandb_project cerebellum \
+    --wandb_run_name phase2_intent_correction

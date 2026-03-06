@@ -2,15 +2,19 @@
 
 Trains:
   - Online encoder (DINOv2 ViT-S + LoRA): produces z_t with gradient flow
-  - Target encoder (EMA copy, no gradient): produces z_t1_target
-  - IntentForwardModel: (z_t, proprio, intent) -> delta_z_ideal
+  - Target encoder (EMA copy, no gradient): produces z_t0_ema, z_t1_ema for targets
+  - IntentForwardModel: (z_t, proprio, intent) -> delta_z_pred
   - ProprioForwardModel: (proprio, intent) -> delta_proprio
 
 Loss:
-  L_visual = MSE(delta_z_ideal, delta_z_target)   where delta_z_target = z_t1_target - z_t.detach()
+  L_visual = MSE(delta_z_pred, delta_z_target)   where delta_z_target = z_t1_ema - z_t0_ema (same-space)
   L_proprio = MSE(delta_proprio_pred, delta_proprio_actual)
   L_vicreg = VICReg_variance(z_t)                 feature collapse prevention
   L_total = L_visual + L_proprio + lambda * L_vicreg
+
+delta_z_target is computed entirely in EMA space (I-JEPA pattern) to avoid
+cross-space instability. The forward model's INPUT z_t comes from the online
+encoder so gradients flow through LoRA.
 
 EMA prevents temporal collapse (tau=0.996). Separate lower LR for LoRA params.
 
@@ -56,6 +60,7 @@ def train_phase1(
     dataset_path: str,
     intent_dir: str,
     output_dir: str,
+    cache_dir: str = "",
     feature_dim: int = 384,
     proprio_dim: int = 8,
     intent_dim: int = 2048,
@@ -110,6 +115,7 @@ def train_phase1(
         intent_dir=intent_dir,
         proprio_dim=proprio_dim,
         decode_workers=decode_workers,
+        cache_dir=cache_dir,
     )
 
     val_size = int(len(dataset) * val_split)
@@ -220,15 +226,16 @@ def train_phase1(
             attention_mask = batch["attention_mask"].to(device)  # (B, 128)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                # Online encoder: z_t (gradient flows)
+                # Online encoder: z_t (gradient flows through LoRA)
                 z_t = online_encoder(frames_t)  # (B, 384)
 
-                # EMA target encoder: z_t1_target (no gradient)
+                # EMA target encoder: both timesteps in same space (I-JEPA pattern)
                 with torch.no_grad():
-                    z_t1_target = ema_enc.encode(frames_t1)  # (B, 384)
+                    z_t0_ema = ema_enc.encode(frames_t)  # (B, 384)
+                    z_t1_ema = ema_enc.encode(frames_t1)  # (B, 384)
+                    delta_z_target = z_t1_ema - z_t0_ema  # same-space delta
 
-                # Forward model: self-attention with full intent token sequence
-                delta_z_target = z_t1_target - z_t.detach()  # stop_grad on z_t for target
+                # Forward model: predict delta_z from online z_t + intent
                 delta_z_pred = forward_model(z_t, proprio_t, intent_tokens, attention_mask)
                 visual_loss = F.mse_loss(delta_z_pred, delta_z_target)
 
@@ -303,9 +310,12 @@ def train_phase1(
                 attention_mask = batch["attention_mask"].to(device)
 
                 z_t = online_encoder(frames_t)
-                z_t1_target = ema_enc.encode(frames_t1)
 
-                delta_z_target = z_t1_target - z_t.detach()
+                # EMA target: both timesteps in same space
+                z_t0_ema = ema_enc.encode(frames_t)
+                z_t1_ema = ema_enc.encode(frames_t1)
+                delta_z_target = z_t1_ema - z_t0_ema
+
                 delta_z_pred = forward_model(z_t, proprio_t, intent_tokens, attention_mask)
                 visual_loss = F.mse_loss(delta_z_pred, delta_z_target)
 
@@ -427,6 +437,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--intent_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--cache_dir", type=str, default="",
+                        help="Disk cache for decoded frames. First run saves, subsequent runs load instantly.")
     parser.add_argument("--feature_dim", type=int, default=384)
     parser.add_argument("--proprio_dim", type=int, default=8)
     parser.add_argument("--intent_dim", type=int, default=2048)
