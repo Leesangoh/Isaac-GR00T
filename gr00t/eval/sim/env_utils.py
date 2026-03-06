@@ -8,6 +8,8 @@ def is_groot_locomanip_env(env_name: str) -> bool:
 def is_behavior_env(env_name: str) -> bool:
     return env_name.startswith("sim_behavior_r1_pro")
 
+def is_widowx_env(env_name: str) -> bool:
+    return env_name.startswith("simpler_env_widowx") or env_name.startswith("widowx")
 
 def is_gr1_env(env_name: str) -> bool:
     """ensures gr1 and gr1_unified are the same embodiment tag"""
@@ -28,5 +30,8 @@ def get_embodiment_tag_from_env_name(env_name: str) -> EmbodimentTag:
 
     if is_gr1_env(env_name):
         return EmbodimentTag.GR1
+    
+    if is_widowx_env(env_name):
+        return EmbodimentTag.OXE_WIDOWX
 
     return EmbodimentTag(env_name.split("/")[0])

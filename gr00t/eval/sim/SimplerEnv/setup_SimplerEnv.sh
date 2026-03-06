@@ -17,7 +17,7 @@ rm -rf "$UV_ENV"
 mkdir -p "$UV_ENV"
 uv venv "$UV_ENV/.venv" --python 3.10
 source "$UV_ENV/.venv/bin/activate"
-uv pip install setuptools>=80.9.0
+uv pip install "setuptools>=80.9.0,<82"
 
 # Core deps (match cluster’s pyproject pattern)
 uv pip install \
@@ -39,7 +39,8 @@ uv pip install --editable "$PROJECT_REPO" --no-deps
 
 uv pip install tianshou==0.5.1 pydantic av zmq torchvision==0.22.0 transformers==4.51.3
 
-# Sanity check
+# Sanity check (run from project root to avoid local simpler_env.py shadowing the package)
+cd "$PROJECT_REPO"
 python - <<'PY'
 from gr00t.eval.sim.SimplerEnv.simpler_env import register_simpler_envs
 register_simpler_envs()

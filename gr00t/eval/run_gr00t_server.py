@@ -49,6 +49,12 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    save_attention_map: bool = False
+    """Save cross-attention heatmaps from the DiT action head."""
+
+    attention_map_dir: str = "./attention_maps"
+    """Directory to save attention map images."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T inference server...")
@@ -69,6 +75,8 @@ def main(config: ServerConfig):
             model_path=config.model_path,
             device=config.device,
             strict=config.strict,
+            save_attention_map=config.save_attention_map,
+            attention_map_dir=config.attention_map_dir,
         )
     elif config.dataset_path is not None:
         if config.modality_config_path is None:

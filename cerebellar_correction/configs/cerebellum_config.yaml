@@ -1,0 +1,47 @@
+# Intent-Conditioned Cerebellar Correction Configuration
+# All dimensions verified from GR00T N1.6 checkpoint
+
+# Visual encoder (DINOv2 ViT-S + LoRA, EMA training)
+visual_backbone: dinov2_vits14
+image_size: 98
+use_visual_lora: true
+visual_lora_rank: 8
+ema_tau: 0.996
+vicreg_lambda: 5.0              # VICReg variance loss weight (collapse prevention)
+
+# Dimensions
+feature_dim: 384      # DINOv2 ViT-S patch token dim
+intent_dim: 2048      # Qwen3-1.7B hidden_size (GR00T backbone)
+action_dim: 7         # WidowX: x, y, z, roll, pitch, yaw, gripper
+proprio_dim: 8        # WidowX: x, y, z, roll, pitch, yaw, pad, gripper
+
+# Forward model (intent-conditioned, NO action input)
+forward_hidden_dim: 256
+forward_num_layers: 3
+
+# Correction network
+correction_hidden_dim: 256
+correction_num_layers: 3
+max_correction: 0.15
+
+# Data paths
+dataset_path: /mnt/md1/solee/data/bridge_lerobot
+model_path: /mnt/md1/solee/checkpoints/GR00T-N1.6-bridge
+intent_dir: data/bridge_intents
+vla_action_dir: data/vla_actions
+
+# Training: Phase 1 (joint DINOv2+LoRA + forward model, EMA)
+phase1_batch_size: 256
+phase1_lr: 1e-3
+phase1_encoder_lr: 1e-4          # LoRA gets lower LR
+phase1_epochs: 50
+
+# Training: Phase 2 (correction network, frozen encoder + forward model)
+phase2_batch_size: 256
+phase2_lr: 5e-4
+phase2_epochs: 50
+
+# Checkpoint paths
+phase1_output: checkpoints/cerebellum_intent/phase1
+phase2_output: checkpoints/cerebellum_intent/phase2
+assembled_ckpt: checkpoints/cerebellum_intent/cerebellum_assembled.pt
