@@ -21,7 +21,7 @@ from gr00t.policy.gr00t_policy import Gr00tPolicy, Gr00tSimPolicyWrapper
 from gr00t.policy.server_client import PolicyServer
 import tyro
 
-from cerebellar_correction.policy.cerebellum_policy import IntentCerebellumPolicyWrapper
+from cerebellar_correction.policy.cerebellum_policy import PatchCerebellumPolicyWrapper
 
 
 DEFAULT_MODEL_SERVER_PORT = 5555
@@ -100,8 +100,8 @@ def main(config: CerebellumServerConfig):
     # 2. Sim policy wrapper
     sim_policy = Gr00tSimPolicyWrapper(gr00t_policy)
 
-    # 3. Intent cerebellum wrapper (hooks GR00T backbone + corrects actions)
-    policy = IntentCerebellumPolicyWrapper(
+    # 3. Patch-level cerebellum wrapper (hooks GR00T backbone + corrects actions)
+    policy = PatchCerebellumPolicyWrapper(
         policy=sim_policy,
         groot_model=gr00t_policy.model,
         cerebellum_ckpt=config.cerebellum_ckpt,

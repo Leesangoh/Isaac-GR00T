@@ -1,9 +1,11 @@
-"""Policy wrapper that applies intent-conditioned cerebellar correction.
+"""Policy wrapper that applies patch-level cerebellar correction (v2).
 
 Wraps Gr00tSimPolicyWrapper. On each get_action call:
-1. GR00T forward pass -> action chunk + intent vector (via hook)
-2. DINOv2 -> visual features for cerebellar correction
-3. Per-step correction using intent-aware prediction error
+1. GR00T forward pass -> action chunk + intent tokens (via hook)
+2. Frozen DINOv2 -> 49 patch tokens for cerebellar correction
+3. TransitionViT prediction -> per-patch prediction error
+4. Attention-weighted pooling -> 384-dim error signal
+5. Correction network -> Δa per-step correction
 
 The client sees the same interface — no changes needed.
 """
@@ -12,25 +14,27 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from gr00t.policy.policy import BasePolicy, PolicyWrapper
 import numpy as np
 import torch
+from gr00t.policy.policy import BasePolicy, PolicyWrapper
 
-from cerebellar_correction.models.cerebellum import CerebellumConfig, IntentCerebellumModule
+from cerebellar_correction.models.cerebellum import CerebellumConfig, PatchCerebellumModule
 from cerebellar_correction.models.intent_extractor import IntentExtractor
 
 
 log = logging.getLogger(__name__)
 
 
-class IntentCerebellumPolicyWrapper(PolicyWrapper):
-    """Wraps Gr00tSimPolicyWrapper with intent-conditioned cerebellar correction.
+class PatchCerebellumPolicyWrapper(PolicyWrapper):
+    """Wraps Gr00tSimPolicyWrapper with patch-level cerebellar correction (v2).
 
     On each get_action:
     1. Gets GR00T's planned action chunk (triggers backbone hook -> intent)
-    2. Extracts intent via IntentExtractor
-    3. Applies cerebellar correction to the first action step
-    4. Returns modified action chunk
+    2. Extracts intent tokens via IntentExtractor
+    3. Computes patch-level prediction error via frozen TransitionViT
+    4. Pools error via learned attention weights
+    5. Applies correction to the first action step
+    6. Returns modified action chunk
     """
 
     def __init__(
@@ -57,7 +61,7 @@ class IntentCerebellumPolicyWrapper(PolicyWrapper):
         # Load cerebellum
         ckpt_dir = Path(cerebellum_ckpt)
         config = CerebellumConfig(max_correction=max_correction)
-        self.cerebellum = IntentCerebellumModule(config)
+        self.cerebellum = PatchCerebellumModule(config)
 
         if (ckpt_dir / "cerebellum_assembled.pt").exists():
             self.cerebellum.load_checkpoint(str(ckpt_dir / "cerebellum_assembled.pt"), device="cpu")
@@ -67,8 +71,10 @@ class IntentCerebellumPolicyWrapper(PolicyWrapper):
 
         self.cerebellum.to(device).eval()
 
-        total_params = sum(p.numel() for p in self.cerebellum.parameters())
-        log.info("Cerebellum loaded: %d params, alpha=%.2f", total_params, correction_alpha)
+        trainable = sum(p.numel() for p in self.cerebellum.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.cerebellum.parameters())
+        log.info("Cerebellum loaded: %d trainable / %d total params, alpha=%.2f",
+                 trainable, total, correction_alpha)
 
     def _load_components(self, ckpt_dir: Path):
         """Load cerebellum from individual phase checkpoints."""
@@ -76,10 +82,10 @@ class IntentCerebellumPolicyWrapper(PolicyWrapper):
         if not phase1.exists():
             phase1 = ckpt_dir
 
-        fm_path = phase1 / "forward_model_best.pt"
-        if fm_path.exists():
-            self.cerebellum.forward_model.load_state_dict(
-                torch.load(fm_path, map_location="cpu", weights_only=True)
+        vit_path = phase1 / "transition_vit_best.pt"
+        if vit_path.exists():
+            self.cerebellum.transition_vit.load_state_dict(
+                torch.load(vit_path, map_location="cpu", weights_only=True)
             )
 
         pf_path = phase1 / "proprio_forward_best.pt"
@@ -91,6 +97,12 @@ class IntentCerebellumPolicyWrapper(PolicyWrapper):
         phase2 = ckpt_dir / "phase2"
         if not phase2.exists():
             phase2 = ckpt_dir
+
+        pool_path = phase2 / "error_pooling_best.pt"
+        if pool_path.exists():
+            self.cerebellum.error_pooling.load_state_dict(
+                torch.load(pool_path, map_location="cpu", weights_only=True)
+            )
 
         cn_path = phase2 / "correction_net_best.pt"
         if cn_path.exists():
@@ -121,15 +133,15 @@ class IntentCerebellumPolicyWrapper(PolicyWrapper):
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Get GR00T action with intent-conditioned cerebellar correction."""
+        """Get GR00T action with patch-level cerebellar correction."""
         # GR00T forward pass (triggers intent hook)
         action, info = self.policy._get_action(observation, options)
 
-        # Extract intent tokens from the hook (full sequence for self-attention)
+        # Extract intent tokens from the hook
         intent_tokens, intent_mask = self.intent_extractor.get_intent_tokens()
         self.cerebellum.on_new_chunk(intent_tokens, intent_mask)
 
-        # Extract current observation for cerebellum
+        # Extract current observation
         image = self._extract_image(observation)
         proprio = self._extract_proprio(observation)
 

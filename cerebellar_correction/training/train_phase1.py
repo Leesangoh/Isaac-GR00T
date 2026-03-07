@@ -1,29 +1,30 @@
-"""Phase 1: Joint DINOv2+LoRA + intent-conditioned forward model training with EMA.
+"""Phase 1: Patch-level Transition ViT training (v2, DINO-WM inspired).
 
 Trains:
-  - Online encoder (DINOv2 ViT-S + LoRA): produces z_t with gradient flow
-  - Target encoder (EMA copy, no gradient): produces z_t0_ema, z_t1_ema for targets
-  - IntentForwardModel: (z_t, proprio, intent) -> delta_z_pred
-  - ProprioForwardModel: (proprio, intent) -> delta_proprio
+  - TransitionViT: (patch_tokens, proprio, intent) -> predicted z_{t+1} patches
+  - ProprioForwardModel: (proprio, intent_pooled) -> Δproprio
+
+Visual encoder is FROZEN DINOv2 ViT-S/14 (no LoRA, no EMA).
+Patch tokens: 49 patches × 384-dim from 98×98 input (7×7 grid).
 
 Loss:
-  L_visual = MSE(delta_z_pred, delta_z_target)   where delta_z_target = z_t1_ema - z_t0_ema (same-space)
-  L_proprio = MSE(delta_proprio_pred, delta_proprio_actual)
-  L_vicreg = VICReg_variance(z_t)                 feature collapse prevention
-  L_total = L_visual + L_proprio + lambda * L_vicreg
+  L_visual = (1/49) Σ ||ẑ_{t+1}^i - z_{t+1}^i||²   (per-patch MSE)
+  L_proprio = ||Δp_pred - (p_{t+1} - p_t)||²
+  L_total = L_visual + λ_proprio × L_proprio
 
-delta_z_target is computed entirely in EMA space (I-JEPA pattern) to avoid
-cross-space instability. The forward model's INPUT z_t comes from the online
-encoder so gradients flow through LoRA.
-
-EMA prevents temporal collapse (tau=0.996). Separate lower LR for LoRA params.
+Key differences from v1:
+  - Frozen encoder → no LoRA, no EMA, no VICReg, stable baseline
+  - 49 patch tokens (not mean-pooled 384-dim)
+  - Predicts absolute z_{t+1} (not Δz)
+  - TransitionViT (4-layer, 8-head) replaces 2-layer IntentForwardModel
+  - Warmup + cosine schedule, gradient clipping
 
 Usage:
     python cerebellar_correction/training/train_phase1.py \
         --dataset_path /mnt/md1/solee/data/bridge_lerobot \
         --intent_dir data/bridge_intents \
         --output_dir checkpoints/cerebellum_intent/phase1 \
-        --num_epochs 50 --batch_size 256
+        --num_epochs 100 --batch_size 128
 """
 
 import argparse
@@ -36,24 +37,11 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 from cerebellar_correction.data.dataset_phase1 import BridgePhase1Dataset
-from cerebellar_correction.models.forward_model import IntentForwardModel, ProprioForwardModel
-from cerebellar_correction.models.visual_encoder import CerebellumVisualEncoder, EMAEncoder
+from cerebellar_correction.models.forward_model import ProprioForwardModel, TransitionViT
+from cerebellar_correction.models.visual_encoder import CerebellumVisualEncoder
 
 
 log = logging.getLogger(__name__)
-
-
-def _get_lora_state_dict(encoder: CerebellumVisualEncoder) -> dict:
-    """Extract only LoRA adapter weights from the encoder."""
-    lora_state = {}
-    for name, param in encoder.backbone.named_parameters():
-        if "lora" in name.lower():
-            lora_state[name] = param.data.clone()
-    return lora_state
-
-
-def _save_lora_weights(encoder: CerebellumVisualEncoder, path: Path):
-    torch.save(_get_lora_state_dict(encoder), path)
 
 
 def train_phase1(
@@ -64,16 +52,17 @@ def train_phase1(
     feature_dim: int = 384,
     proprio_dim: int = 8,
     intent_dim: int = 2048,
-    hidden_dim: int = 256,
-    num_layers: int = 3,
-    lora_rank: int = 8,
-    batch_size: int = 256,
-    learning_rate: float = 1e-3,
-    encoder_lr: float = 1e-4,
-    weight_decay: float = 1e-4,
-    num_epochs: int = 50,
-    vicreg_lambda: float = 5.0,
-    ema_tau: float = 0.996,
+    num_patches: int = 49,
+    num_layers: int = 4,
+    num_heads: int = 8,
+    ffn_dim: int = 1536,
+    batch_size: int = 128,
+    learning_rate: float = 3e-4,
+    intent_proj_lr: float = 5e-4,
+    weight_decay: float = 0.01,
+    num_epochs: int = 100,
+    warmup_epochs: int = 5,
+    proprio_lambda: float = 0.1,
     val_split: float = 0.1,
     device: str = "cuda",
     num_workers: int = 4,
@@ -90,26 +79,28 @@ def train_phase1(
 
         wandb.init(
             project=wandb_project,
-            name=wandb_run_name or "phase1_intent_ema",
+            name=wandb_run_name or "phase1_patch_vit",
             config={
-                "phase": "1-intent-EMA",
+                "phase": "1-patch-vit-v2",
                 "feature_dim": feature_dim,
                 "proprio_dim": proprio_dim,
                 "intent_dim": intent_dim,
-                "hidden_dim": hidden_dim,
+                "num_patches": num_patches,
                 "num_layers": num_layers,
-                "lora_rank": lora_rank,
+                "num_heads": num_heads,
+                "ffn_dim": ffn_dim,
                 "batch_size": batch_size,
                 "learning_rate": learning_rate,
-                "encoder_lr": encoder_lr,
-                "vicreg_lambda": vicreg_lambda,
-                "ema_tau": ema_tau,
+                "intent_proj_lr": intent_proj_lr,
+                "weight_decay": weight_decay,
+                "warmup_epochs": warmup_epochs,
+                "proprio_lambda": proprio_lambda,
                 "num_epochs": num_epochs,
             },
         )
 
-    # Dataset (decodes all frames into RAM)
-    log.info("Loading dataset from %s (this may take a while)...", dataset_path)
+    # Dataset
+    log.info("Loading dataset from %s...", dataset_path)
     dataset = BridgePhase1Dataset(
         dataset_path=dataset_path,
         intent_dir=intent_dir,
@@ -144,75 +135,70 @@ def train_phase1(
     log.info("Train: %d pairs, Val: %d pairs", train_size, val_size)
 
     # === Models ===
-    online_encoder = CerebellumVisualEncoder(
+    # Frozen DINOv2 encoder (patch-level output)
+    encoder = CerebellumVisualEncoder(
         backbone="dinov2_vits14",
-        use_lora=True,
-        lora_rank=lora_rank,
+        use_lora=False,
+        input_size=98,
     ).to(device)
-    online_encoder.train()
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad = False
+    log.info("Frozen DINOv2 encoder loaded (21M params, no LoRA)")
 
-    # EMA target encoder
-    ema_enc = EMAEncoder(online_encoder, tau=ema_tau)
-    ema_enc.target_encoder.to(device)
-    log.info("EMA target encoder created (tau=%.4f)", ema_tau)
-
-    forward_model = IntentForwardModel(
+    # Transition ViT
+    transition_vit = TransitionViT(
         feature_dim=feature_dim,
         proprio_dim=proprio_dim,
         intent_dim=intent_dim,
+        num_patches=num_patches,
         num_layers=num_layers,
-        num_heads=6,
-        ffn_dim=1536,
+        num_heads=num_heads,
+        ffn_dim=ffn_dim,
+        max_intent_tokens=128,
     ).to(device)
 
+    # Proprio forward model (uses pooled intent)
     proprio_forward = ProprioForwardModel(
         proprio_dim=proprio_dim,
         intent_dim=intent_dim,
     ).to(device)
 
-    # Separate param groups: encoder LoRA gets lower LR
-    encoder_params = []
-    for name, param in online_encoder.named_parameters():
-        if param.requires_grad:
-            encoder_params.append(param)
+    vit_count = sum(p.numel() for p in transition_vit.parameters())
+    proprio_count = sum(p.numel() for p in proprio_forward.parameters())
+    log.info("Trainable params — TransitionViT: %d, Proprio: %d, Total: %d",
+             vit_count, proprio_count, vit_count + proprio_count)
+
+    # Optimizer with separate lr for intent projection
+    intent_proj_params = list(transition_vit.intent_proj.parameters())
+    intent_proj_ids = {id(p) for p in intent_proj_params}
+    vit_other_params = [p for p in transition_vit.parameters() if id(p) not in intent_proj_ids]
 
     param_groups = [
-        {
-            "params": list(forward_model.parameters()) + list(proprio_forward.parameters()),
-            "lr": learning_rate,
-        },
-        {
-            "params": encoder_params,
-            "lr": encoder_lr,
-        },
+        {"params": vit_other_params, "lr": learning_rate},
+        {"params": intent_proj_params, "lr": intent_proj_lr},
+        {"params": list(proprio_forward.parameters()), "lr": learning_rate},
     ]
-
-    encoder_count = sum(p.numel() for p in encoder_params)
-    forward_count = sum(p.numel() for p in forward_model.parameters())
-    proprio_count = sum(p.numel() for p in proprio_forward.parameters())
-    log.info(
-        "Trainable params — Encoder: %d, Forward: %d, Proprio: %d",
-        encoder_count,
-        forward_count,
-        proprio_count,
-    )
-
     optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    # Warmup + cosine schedule
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(num_epochs - warmup_epochs, 1)
+        return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159265)).item())
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda")
 
     best_val_loss = float("inf")
 
     for epoch in range(num_epochs):
         # === Training ===
-        online_encoder.train()
-        forward_model.train()
+        transition_vit.train()
         proprio_forward.train()
         train_vis_loss = 0.0
         train_prop_loss = 0.0
-        train_var_loss = 0.0
-        train_z_std_sum = 0.0
-        train_dz_norm_sum = 0.0
         train_steps = 0
 
         for batch in tqdm(
@@ -222,80 +208,56 @@ def train_phase1(
             frames_t1 = batch["frame_t1"].to(device, dtype=torch.float32).div_(255.0)
             proprio_t = batch["proprio_t"].to(device)
             proprio_t1 = batch["proprio_t1"].to(device)
-            intent_tokens = batch["intent_tokens"].to(device).float()  # (B, 128, 2048)
-            attention_mask = batch["attention_mask"].to(device)  # (B, 128)
+            intent_tokens = batch["intent_tokens"].to(device).float()
+            attention_mask = batch["attention_mask"].to(device)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                # Online encoder: z_t (gradient flows through LoRA)
-                z_t = online_encoder(frames_t)  # (B, 384)
-
-                # EMA target encoder: both timesteps in same space (I-JEPA pattern)
+                # Frozen encoder → patch tokens
                 with torch.no_grad():
-                    z_t0_ema = ema_enc.encode(frames_t)  # (B, 384)
-                    z_t1_ema = ema_enc.encode(frames_t1)  # (B, 384)
-                    delta_z_target = z_t1_ema - z_t0_ema  # same-space delta
+                    z_t_patches = encoder.forward_patches(frames_t)    # (B, 49, 384)
+                    z_t1_patches = encoder.forward_patches(frames_t1)  # (B, 49, 384) target
 
-                # Forward model: predict delta_z from online z_t + intent
-                delta_z_pred = forward_model(z_t, proprio_t, intent_tokens, attention_mask)
-                visual_loss = F.mse_loss(delta_z_pred, delta_z_target)
+                # Transition ViT predicts z_{t+1}
+                z_t1_pred = transition_vit(
+                    z_t_patches, proprio_t, intent_tokens, attention_mask
+                )
 
-                # Proprio forward model: uses pooled intent (MLP)
-                mask_f = attention_mask.unsqueeze(-1).float()  # (B, 128, 1)
+                # Per-patch MSE
+                visual_loss = F.mse_loss(z_t1_pred, z_t1_patches)
+
+                # Proprio forward model
+                mask_f = attention_mask.unsqueeze(-1).float()
                 intent_pooled = (intent_tokens * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
                 delta_proprio_target = proprio_t1 - proprio_t
                 delta_proprio_pred = proprio_forward(proprio_t, intent_pooled)
                 proprio_loss = F.mse_loss(delta_proprio_pred, delta_proprio_target)
 
-                # VICReg variance loss on z_t
-                z_std = z_t.float().std(dim=0)  # (384,)
-                variance_loss = F.relu(1.0 - z_std).mean()
-
-                total_loss = visual_loss + proprio_loss + vicreg_lambda * variance_loss
+                total_loss = visual_loss + proprio_lambda * proprio_loss
 
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
-
             scaler.unscale_(optimizer)
-            all_params = (
-                list(online_encoder.parameters())
-                + list(forward_model.parameters())
-                + list(proprio_forward.parameters())
-            )
-            torch.nn.utils.clip_grad_norm_([p for p in all_params if p.requires_grad], 1.0)
+            all_params = list(transition_vit.parameters()) + list(proprio_forward.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            # EMA update
-            ema_enc.update(online_encoder)
-
-            with torch.no_grad():
-                dz_norm = delta_z_target.float().norm(dim=-1).mean().item()
-
             train_vis_loss += visual_loss.item()
             train_prop_loss += proprio_loss.item()
-            train_var_loss += variance_loss.item()
-            train_z_std_sum += z_std.mean().item()
-            train_dz_norm_sum += dz_norm
             train_steps += 1
 
         scheduler.step()
 
         avg_train_vis = train_vis_loss / max(train_steps, 1)
         avg_train_prop = train_prop_loss / max(train_steps, 1)
-        avg_train_var = train_var_loss / max(train_steps, 1)
-        avg_train_z_std = train_z_std_sum / max(train_steps, 1)
-        avg_train_dz = train_dz_norm_sum / max(train_steps, 1)
 
         # === Validation ===
-        online_encoder.eval()
-        forward_model.eval()
+        transition_vit.eval()
         proprio_forward.eval()
         val_vis_loss = 0.0
         val_prop_loss = 0.0
-        val_var_loss = 0.0
-        val_z_std_sum = 0.0
-        val_dz_norm_sum = 0.0
         val_baseline_loss = 0.0
+        val_per_patch_losses = torch.zeros(num_patches, device=device)
         val_steps = 0
 
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -309,15 +271,21 @@ def train_phase1(
                 intent_tokens = batch["intent_tokens"].to(device).float()
                 attention_mask = batch["attention_mask"].to(device)
 
-                z_t = online_encoder(frames_t)
+                z_t_patches = encoder.forward_patches(frames_t)
+                z_t1_patches = encoder.forward_patches(frames_t1)
 
-                # EMA target: both timesteps in same space
-                z_t0_ema = ema_enc.encode(frames_t)
-                z_t1_ema = ema_enc.encode(frames_t1)
-                delta_z_target = z_t1_ema - z_t0_ema
+                z_t1_pred = transition_vit(
+                    z_t_patches, proprio_t, intent_tokens, attention_mask
+                )
 
-                delta_z_pred = forward_model(z_t, proprio_t, intent_tokens, attention_mask)
-                visual_loss = F.mse_loss(delta_z_pred, delta_z_target)
+                visual_loss = F.mse_loss(z_t1_pred, z_t1_patches)
+
+                # Per-patch loss for monitoring
+                per_patch = (z_t1_pred - z_t1_patches).float().pow(2).mean(dim=(0, 2))  # (49,)
+                val_per_patch_losses += per_patch
+
+                # Baseline: predict z_{t+1} = z_t (copy current state)
+                baseline = F.mse_loss(z_t_patches, z_t1_patches)
 
                 mask_f = attention_mask.unsqueeze(-1).float()
                 intent_pooled = (intent_tokens * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
@@ -325,104 +293,71 @@ def train_phase1(
                 delta_proprio_pred = proprio_forward(proprio_t, intent_pooled)
                 proprio_loss = F.mse_loss(delta_proprio_pred, delta_proprio_target)
 
-                z_std = z_t.float().std(dim=0)
-                variance_loss = F.relu(1.0 - z_std).mean()
-
-                dz_norm = delta_z_target.float().norm(dim=-1).mean().item()
-
-                # Baseline: predict delta_z = 0
-                baseline = F.mse_loss(torch.zeros_like(delta_z_target), delta_z_target)
-
                 val_vis_loss += visual_loss.item()
                 val_prop_loss += proprio_loss.item()
-                val_var_loss += variance_loss.item()
-                val_z_std_sum += z_std.mean().item()
-                val_dz_norm_sum += dz_norm
                 val_baseline_loss += baseline.item()
                 val_steps += 1
 
         avg_val_vis = val_vis_loss / max(val_steps, 1)
         avg_val_prop = val_prop_loss / max(val_steps, 1)
-        avg_val_var = val_var_loss / max(val_steps, 1)
-        avg_val_total = avg_val_vis + avg_val_prop
-        avg_val_z_std = val_z_std_sum / max(val_steps, 1)
-        avg_val_dz = val_dz_norm_sum / max(val_steps, 1)
+        avg_val_total = avg_val_vis + proprio_lambda * avg_val_prop
         avg_val_baseline = val_baseline_loss / max(val_steps, 1)
         improvement_pct = (avg_val_baseline - avg_val_vis) / max(avg_val_baseline, 1e-8) * 100
 
+        avg_per_patch = val_per_patch_losses / max(val_steps, 1)
+        patch_loss_std = avg_per_patch.std().item()
+        patch_loss_max_idx = avg_per_patch.argmax().item()
+
+        current_lr = scheduler.get_last_lr()[0]
+
         log.info(
-            "Epoch %d/%d | Train vis=%.6f prop=%.6f var=%.6f z_std=%.3f dz=%.3f | "
-            "Val vis=%.6f prop=%.6f z_std=%.3f dz=%.3f baseline=%.6f improv=%.1f%% | LR=%.2e",
-            epoch + 1,
-            num_epochs,
-            avg_train_vis,
-            avg_train_prop,
-            avg_train_var,
-            avg_train_z_std,
-            avg_train_dz,
-            avg_val_vis,
-            avg_val_prop,
-            avg_val_z_std,
-            avg_val_dz,
-            avg_val_baseline,
-            improvement_pct,
-            scheduler.get_last_lr()[0],
+            "Epoch %d/%d | Train vis=%.6f prop=%.6f | "
+            "Val vis=%.6f prop=%.6f baseline=%.6f improv=%.1f%% | "
+            "Patch std=%.4f max_idx=%d | LR=%.2e",
+            epoch + 1, num_epochs,
+            avg_train_vis, avg_train_prop,
+            avg_val_vis, avg_val_prop, avg_val_baseline, improvement_pct,
+            patch_loss_std, patch_loss_max_idx, current_lr,
         )
 
         if use_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch + 1,
-                    "train/visual_loss": avg_train_vis,
-                    "train/proprio_loss": avg_train_prop,
-                    "train/variance_loss": avg_train_var,
-                    "train/z_std_mean": avg_train_z_std,
-                    "train/dz_norm": avg_train_dz,
-                    "val/visual_loss": avg_val_vis,
-                    "val/proprio_loss": avg_val_prop,
-                    "val/variance_loss": avg_val_var,
-                    "val/total_loss": avg_val_total,
-                    "val/z_std_mean": avg_val_z_std,
-                    "val/dz_norm": avg_val_dz,
-                    "val/baseline_loss": avg_val_baseline,
-                    "val/improvement_pct": improvement_pct,
-                    "lr": scheduler.get_last_lr()[0],
-                },
-                step=epoch + 1,
-            )
+            log_dict = {
+                "epoch": epoch + 1,
+                "train/visual_loss": avg_train_vis,
+                "train/proprio_loss": avg_train_prop,
+                "train/total_loss": avg_train_vis + proprio_lambda * avg_train_prop,
+                "val/visual_loss": avg_val_vis,
+                "val/proprio_loss": avg_val_prop,
+                "val/total_loss": avg_val_total,
+                "val/baseline_loss": avg_val_baseline,
+                "val/improvement_pct": improvement_pct,
+                "val/patch_loss_std": patch_loss_std,
+                "val/patch_loss_max_idx": patch_loss_max_idx,
+                "lr": current_lr,
+            }
+            wandb.log(log_dict, step=epoch + 1)
 
         # Save best
         if avg_val_total < best_val_loss:
             best_val_loss = avg_val_total
-            # Save encoder (full state for loading in Phase 2)
-            torch.save(online_encoder.state_dict(), output_dir / "encoder_best.pt")
-            _save_lora_weights(online_encoder, output_dir / "encoder_lora_best.pt")
-            torch.save(
-                {"norm": online_encoder.norm.state_dict()},
-                output_dir / "encoder_norm_best.pt",
-            )
-            torch.save(forward_model.state_dict(), output_dir / "forward_model_best.pt")
+            torch.save(transition_vit.state_dict(), output_dir / "transition_vit_best.pt")
             torch.save(proprio_forward.state_dict(), output_dir / "proprio_forward_best.pt")
             log.info("  -> Best model saved (val_loss=%.6f)", avg_val_total)
 
         # Periodic checkpoint
         if (epoch + 1) % 10 == 0:
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "online_encoder": online_encoder.state_dict(),
-                    "forward_model": forward_model.state_dict(),
-                    "proprio_forward": proprio_forward.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "best_val_loss": best_val_loss,
-                },
-                output_dir / f"checkpoint_epoch{epoch + 1}.pt",
-            )
+            ckpt = {
+                "epoch": epoch + 1,
+                "transition_vit": transition_vit.state_dict(),
+                "proprio_forward": proprio_forward.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_val_loss": best_val_loss,
+            }
+            torch.save(ckpt, output_dir / f"checkpoint_epoch{epoch + 1}.pt")
 
     # Save final
-    torch.save(online_encoder.state_dict(), output_dir / "encoder_final.pt")
-    torch.save(forward_model.state_dict(), output_dir / "forward_model_final.pt")
+    torch.save(transition_vit.state_dict(), output_dir / "transition_vit_final.pt")
     torch.save(proprio_forward.state_dict(), output_dir / "proprio_forward_final.pt")
     log.info("Phase 1 training complete. Best val_loss=%.6f", best_val_loss)
 
@@ -433,25 +368,26 @@ def train_phase1(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    parser = argparse.ArgumentParser(description="Phase 1: Intent-conditioned forward model (EMA)")
+    parser = argparse.ArgumentParser(description="Phase 1: Patch-level Transition ViT (v2)")
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--intent_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, default="",
-                        help="Disk cache for decoded frames. First run saves, subsequent runs load instantly.")
+                        help="Disk cache for decoded frames.")
     parser.add_argument("--feature_dim", type=int, default=384)
     parser.add_argument("--proprio_dim", type=int, default=8)
     parser.add_argument("--intent_dim", type=int, default=2048)
-    parser.add_argument("--hidden_dim", type=int, default=256, help="(unused, kept for compat)")
-    parser.add_argument("--num_layers", type=int, default=2, help="Self-attention layers")
-    parser.add_argument("--lora_rank", type=int, default=8)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--encoder_lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument("--vicreg_lambda", type=float, default=5.0)
-    parser.add_argument("--ema_tau", type=float, default=0.996)
+    parser.add_argument("--num_patches", type=int, default=49)
+    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--ffn_dim", type=int, default=1536)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--intent_proj_lr", type=float, default=5e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--proprio_lambda", type=float, default=0.1)
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_workers", type=int, default=4)

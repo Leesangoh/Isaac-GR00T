@@ -17,7 +17,6 @@ Float conversion + CHW transpose happens per-sample in __getitem__.
 import json
 import logging
 import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +31,7 @@ log = logging.getLogger(__name__)
 
 MAX_INTENT_TOKENS = 128
 INTENT_DIM = 2048
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 class BridgePhase1Dataset(Dataset):
@@ -79,7 +78,13 @@ class BridgePhase1Dataset(Dataset):
         proprio_dim: int,
         load_workers: int,
     ) -> bool:
-        """Try to load from disk cache. Returns True on success."""
+        """Try to load from disk cache. Returns True on success.
+
+        Supports upgrade from v1 (frames only) to v2 (frames + intent tokens):
+        - v2 cache: mmap everything instantly
+        - v1 cache: load frames from cache, build intent_tokens.npy from .npz files,
+          upgrade to v2 (no re-decode needed)
+        """
         meta_path = cache_dir / "cache_meta.json"
         if not meta_path.exists():
             log.info("No cache found at %s, will decode from scratch", cache_dir)
@@ -88,61 +93,66 @@ class BridgePhase1Dataset(Dataset):
         with open(meta_path) as f:
             meta = json.load(f)
 
-        if meta.get("version") != CACHE_VERSION:
-            log.info("Cache version mismatch, will re-decode")
+        cache_version = meta.get("version", 0)
+        if cache_version not in (1, CACHE_VERSION):
+            log.info("Cache version %s not supported, will re-decode", cache_version)
             return False
 
         total_pairs = meta["total_pairs"]
         h, w = meta["h"], meta["w"]
         ep_order = meta["episode_order"]  # list of (ep_id, n_pairs)
 
-        log.info("Loading from cache: %d pairs, %d episodes", total_pairs, len(ep_order))
+        log.info("Loading from cache (v%d): %d pairs, %d episodes",
+                 cache_version, total_pairs, len(ep_order))
 
-        # Load frames/proprios/masks from cache (mmap for speed)
-        log.info("Loading cached frames (~%.1f GB)...", total_pairs * 2 * h * w * 3 / 1e9)
+        # Load frames/proprios/masks (same for v1 and v2)
+        log.info("Memory-mapping frames/proprios/masks...")
         frames_t_hwc = np.load(cache_dir / "frames_t.npy", mmap_mode="r")
         frames_t1_hwc = np.load(cache_dir / "frames_t1.npy", mmap_mode="r")
         proprio_buf = np.load(cache_dir / "proprio_t.npy")
         proprio1_buf = np.load(cache_dir / "proprio_t1.npy")
         attn_mask_buf = np.load(cache_dir / "attn_masks.npy")
-        log.info("Cached frames/proprios/masks loaded")
 
-        # Load intent tokens in parallel (I/O bound → threads)
-        log.info(
-            "Loading intent tokens from %d episodes (~%.1f GB)...",
-            len(ep_order),
-            total_pairs * MAX_INTENT_TOKENS * INTENT_DIM * 2 / 1e9,
-        )
-        intent_tokens_buf = np.empty(
-            (total_pairs, MAX_INTENT_TOKENS, INTENT_DIM), dtype=np.float16
-        )
+        # Intent tokens
+        intent_npy = cache_dir / "intent_tokens.npy"
+        if cache_version >= CACHE_VERSION and intent_npy.exists():
+            # v2: mmap intent tokens instantly
+            log.info("Memory-mapping intent tokens (~%.1f GB)...",
+                     total_pairs * MAX_INTENT_TOKENS * INTENT_DIM * 2 / 1e9)
+            intent_tokens_buf = np.load(intent_npy, mmap_mode="r")
+        else:
+            # v1 → v2 upgrade: build intent_tokens.npy from individual .npz files
+            log.info(
+                "Upgrading cache v1→v2: building intent_tokens.npy from %d episodes...",
+                len(ep_order),
+            )
+            intent_tokens_buf = np.empty(
+                (total_pairs, MAX_INTENT_TOKENS, INTENT_DIM), dtype=np.float16
+            )
+            offset = 0
+            for ep_id, n_pairs in tqdm(ep_order, desc="Loading intent tokens"):
+                data = np.load(intent_dir / f"{ep_id}.npz")
+                tokens = data["intent_tokens"]  # (T, 128, 2048) fp16
+                intent_tokens_buf[offset : offset + n_pairs] = tokens[:n_pairs]
+                offset += n_pairs
 
-        def _load_intent(task):
-            ep_id, offset, n_pairs = task
-            data = np.load(intent_dir / f"{ep_id}.npz")
-            tokens = data["intent_tokens"]  # (T, 128, 2048) fp16
-            intent_tokens_buf[offset : offset + n_pairs] = tokens[:n_pairs]
+            # Save consolidated .npy so next run is instant
+            log.info("Saving intent_tokens.npy (~%.1f GB)...",
+                     intent_tokens_buf.nbytes / 1e9)
+            np.save(intent_npy, intent_tokens_buf)
 
-        tasks = []
-        offset = 0
-        for ep_id, n_pairs in ep_order:
-            tasks.append((ep_id, offset, n_pairs))
-            offset += n_pairs
+            # Upgrade cache version
+            meta["version"] = CACHE_VERSION
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+            log.info("Cache upgraded to v%d", CACHE_VERSION)
 
-        n_threads = min(load_workers, 64)
-        with ThreadPoolExecutor(max_workers=n_threads) as pool:
-            list(tqdm(
-                pool.map(_load_intent, tasks),
-                total=len(tasks),
-                desc="Loading intent tokens",
-            ))
+            # Re-open as mmap to free the RAM copy
+            del intent_tokens_buf
+            intent_tokens_buf = np.load(intent_npy, mmap_mode="r")
 
-        # Copy frames from mmap to RAM for fast random access during training
-        log.info("Copying frames to RAM...")
-        self.frames_t = np.array(frames_t_hwc)
-        self.frames_t1 = np.array(frames_t1_hwc)
-        del frames_t_hwc, frames_t1_hwc
-
+        self.frames_t = frames_t_hwc
+        self.frames_t1 = frames_t1_hwc
         self.proprio_t = torch.from_numpy(proprio_buf)
         self.proprio_t1 = torch.from_numpy(proprio1_buf)
         self.intent_tokens = intent_tokens_buf
@@ -152,18 +162,24 @@ class BridgePhase1Dataset(Dataset):
         return True
 
     def _save_to_cache(self, cache_dir: Path):
-        """Save frames/proprios/masks to disk cache."""
+        """Save all arrays (frames, proprios, masks, intent tokens) to disk cache."""
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        log.info("Saving cache to %s (~%.1f GB)...", cache_dir,
-                 (self.frames_t.nbytes + self.frames_t1.nbytes +
-                  self.proprio_t.numpy().nbytes * 2 + self.attention_masks.nbytes) / 1e9)
+        total_bytes = (
+            self.frames_t.nbytes + self.frames_t1.nbytes
+            + self.proprio_t.numpy().nbytes * 2
+            + self.attention_masks.nbytes
+            + self.intent_tokens.nbytes
+        )
+        log.info("Saving cache to %s (~%.1f GB)...", cache_dir, total_bytes / 1e9)
 
         np.save(cache_dir / "frames_t.npy", self.frames_t)
         np.save(cache_dir / "frames_t1.npy", self.frames_t1)
         np.save(cache_dir / "proprio_t.npy", self.proprio_t.numpy())
         np.save(cache_dir / "proprio_t1.npy", self.proprio_t1.numpy())
         np.save(cache_dir / "attn_masks.npy", self.attention_masks)
+        log.info("Saving intent tokens (~%.1f GB)...", self.intent_tokens.nbytes / 1e9)
+        np.save(cache_dir / "intent_tokens.npy", self.intent_tokens)
 
         meta = {
             "version": CACHE_VERSION,

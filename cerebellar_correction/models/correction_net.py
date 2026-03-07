@@ -12,7 +12,40 @@ stronger corrections for later chunk steps where VLA predictions drift more.
 """
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+
+class AttentionWeightedPooling(nn.Module):
+    """Attention-weighted pooling of per-patch prediction errors.
+
+    Learns which patches carry the most informative prediction errors
+    (e.g., patches near the robot arm or manipulated object).
+
+    Input: (B, N_patches, feature_dim) — per-patch prediction error
+    Output: (B, feature_dim) — weighted sum
+
+    Parameters: ~50K.
+    """
+
+    def __init__(self, feature_dim: int = 384, hidden_dim: int = 128):
+        super().__init__()
+        self.score_mlp = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, patch_errors: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            patch_errors: (B, N_patches, feature_dim)
+        Returns:
+            pooled: (B, feature_dim)
+        """
+        scores = self.score_mlp(patch_errors)  # (B, N_patches, 1)
+        weights = F.softmax(scores, dim=1)  # (B, N_patches, 1)
+        return (weights * patch_errors).sum(dim=1)  # (B, feature_dim)
 
 
 class CorrectionNetwork(nn.Module):

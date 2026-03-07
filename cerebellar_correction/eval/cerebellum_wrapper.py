@@ -24,25 +24,25 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from cerebellar_correction.models.cerebellum import IntentCerebellumModule
+from cerebellar_correction.models.cerebellum import PatchCerebellumModule
 from cerebellar_correction.models.intent_extractor import IntentExtractor
 
 
 log = logging.getLogger(__name__)
 
 
-class IntentCerebellumMultiStepWrapper(MultiStepWrapper):
+class PatchCerebellumMultiStepWrapper(MultiStepWrapper):
     """MultiStepWrapper that applies intent-conditioned cerebellar correction at each sub-step.
 
     During action chunk execution, each individual action is corrected
-    using the IntentCerebellumModule. The intent vector is extracted once
+    using the PatchCerebellumModule. The intent vector is extracted once
     per chunk (from GR00T's forward pass) and reused for all steps.
     """
 
     def __init__(
         self,
         env,
-        cerebellum: IntentCerebellumModule,
+        cerebellum: PatchCerebellumModule,
         intent_extractor: IntentExtractor,
         video_delta_indices,
         state_delta_indices,

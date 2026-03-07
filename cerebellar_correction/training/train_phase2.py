@@ -1,13 +1,12 @@
-"""Phase 2: Train correction network using actual VLA errors + intent.
+"""Phase 2: Patch-level correction network training (v2).
 
-Uses the frozen Phase 1 encoder to compute DINOv2 features on-the-fly from
-raw images. The frozen intent-conditioned forward model generates prediction
-errors, and the correction network learns to map them to action corrections.
+Uses frozen Phase 1 modules (DINOv2 + TransitionViT) to compute per-patch
+prediction errors, then trains AttentionWeightedPooling + CorrectionNetwork.
 
-Forward model: (z_t, proprio, intent) -> delta_z_ideal  (FROZEN from Phase 1)
-Visual encoder: DINOv2+LoRA (FROZEN from Phase 1, on-the-fly feature computation)
-Correction target: action_expert - action_vla  (actual VLA errors)
-Correction input: intent-aware prediction error + action_vla + proprio + chunk_step
+Prediction error: E = Z_{t+1} - Ẑ_{t+1}  (49×384, per-patch)
+Pooled error: e = attention_pool(E) → 384-dim
+Correction: Δa = correction_net(e, a_vla, proprio, chunk_step)
+Target: a_expert - a_vla (actual VLA errors)
 
 Usage:
     python cerebellar_correction/training/train_phase2.py \
@@ -29,8 +28,8 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 from cerebellar_correction.data.dataset_phase2 import BridgePhase2Dataset
-from cerebellar_correction.models.correction_net import CorrectionNetwork
-from cerebellar_correction.models.forward_model import IntentForwardModel
+from cerebellar_correction.models.correction_net import AttentionWeightedPooling, CorrectionNetwork
+from cerebellar_correction.models.forward_model import TransitionViT
 from cerebellar_correction.models.visual_encoder import CerebellumVisualEncoder
 
 
@@ -47,14 +46,16 @@ def train_phase2(
     action_dim: int = 7,
     proprio_dim: int = 8,
     intent_dim: int = 2048,
+    num_patches: int = 49,
+    transition_num_layers: int = 4,
+    transition_num_heads: int = 8,
+    transition_ffn_dim: int = 1536,
     hidden_dim: int = 256,
     num_layers: int = 3,
+    pooling_hidden_dim: int = 128,
     max_correction: float = 0.15,
-    forward_hidden_dim: int = 256,
-    forward_num_layers: int = 3,
-    lora_rank: int = 8,
     batch_size: int = 256,
-    learning_rate: float = 5e-4,
+    learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
     num_epochs: int = 50,
     val_split: float = 0.1,
@@ -74,13 +75,15 @@ def train_phase2(
 
         wandb.init(
             project=wandb_project,
-            name=wandb_run_name or "phase2_intent_correction",
+            name=wandb_run_name or "phase2_patch_correction",
             config={
-                "phase": "2-intent",
+                "phase": "2-patch-correction-v2",
                 "feature_dim": feature_dim,
                 "action_dim": action_dim,
                 "intent_dim": intent_dim,
+                "num_patches": num_patches,
                 "hidden_dim": hidden_dim,
+                "pooling_hidden_dim": pooling_hidden_dim,
                 "max_correction": max_correction,
                 "batch_size": batch_size,
                 "learning_rate": learning_rate,
@@ -88,7 +91,7 @@ def train_phase2(
             },
         )
 
-    # Dataset (decodes frames into RAM)
+    # Dataset
     log.info("Loading Phase 2 dataset...")
     dataset = BridgePhase2Dataset(
         dataset_path=dataset_path,
@@ -144,38 +147,44 @@ def train_phase2(
 
     log.info("Train: %d pairs, Val: %d pairs", train_size, val_size)
 
-    # Load frozen visual encoder from Phase 1
+    # === Frozen models from Phase 1 ===
+    # Frozen DINOv2 encoder (patch-level)
     visual_encoder = CerebellumVisualEncoder(
         backbone="dinov2_vits14",
-        use_lora=True,
-        lora_rank=lora_rank,
+        use_lora=False,
     ).to(device)
-    encoder_path = phase1_dir / "encoder_best.pt"
-    visual_encoder.load_state_dict(torch.load(encoder_path, map_location=device, weights_only=True))
     visual_encoder.eval()
     for p in visual_encoder.parameters():
         p.requires_grad = False
-    log.info("Loaded frozen visual encoder from %s", encoder_path)
+    log.info("Frozen DINOv2 encoder loaded")
 
-    # Load frozen forward models from Phase 1 (self-attention)
-    forward_model = IntentForwardModel(
+    # Frozen Transition ViT from Phase 1
+    transition_vit = TransitionViT(
         feature_dim=feature_dim,
         proprio_dim=proprio_dim,
         intent_dim=intent_dim,
-        num_layers=forward_num_layers,
-        num_heads=6,
-        ffn_dim=1536,
+        num_patches=num_patches,
+        num_layers=transition_num_layers,
+        num_heads=transition_num_heads,
+        ffn_dim=transition_ffn_dim,
     ).to(device)
-    forward_model.load_state_dict(
-        torch.load(phase1_dir / "forward_model_best.pt", map_location=device, weights_only=True)
+    vit_path = phase1_dir / "transition_vit_best.pt"
+    transition_vit.load_state_dict(
+        torch.load(vit_path, map_location=device, weights_only=True)
     )
-    forward_model.eval()
-    for p in forward_model.parameters():
+    transition_vit.eval()
+    for p in transition_vit.parameters():
         p.requires_grad = False
+    log.info("Loaded frozen TransitionViT from %s", vit_path)
 
-    log.info("Loaded frozen intent-conditioned forward model from Phase 1")
+    # === Trainable modules ===
+    # Attention-weighted pooling
+    error_pooling = AttentionWeightedPooling(
+        feature_dim=feature_dim,
+        hidden_dim=pooling_hidden_dim,
+    ).to(device)
 
-    # Correction network (to train)
+    # Correction network
     correction_net = CorrectionNetwork(
         feature_dim=feature_dim,
         action_dim=action_dim,
@@ -185,17 +194,20 @@ def train_phase2(
         max_correction=max_correction,
     ).to(device)
 
-    log.info("Correction net params: %d", sum(p.numel() for p in correction_net.parameters()))
+    pooling_count = sum(p.numel() for p in error_pooling.parameters())
+    correction_count = sum(p.numel() for p in correction_net.parameters())
+    log.info("Trainable params — Pooling: %d, Correction: %d, Total: %d",
+             pooling_count, correction_count, pooling_count + correction_count)
 
-    optimizer = torch.optim.AdamW(
-        correction_net.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
+    trainable_params = list(error_pooling.parameters()) + list(correction_net.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
     best_val_loss = float("inf")
 
     for epoch in range(num_epochs):
-        # Training
+        # === Training ===
+        error_pooling.train()
         correction_net.train()
         train_loss = 0.0
         train_steps = 0
@@ -208,25 +220,27 @@ def train_phase2(
             action_expert = batch["action_expert"].to(device)
             action_vla = batch["action_vla"].to(device)
             proprio_t = batch["proprio_t"].to(device)
-            intent_tokens = batch["intent_tokens"].to(device).float()  # (B, 128, 2048)
-            attention_mask = batch["attention_mask"].to(device)  # (B, 128)
+            intent_tokens = batch["intent_tokens"].to(device).float()
+            attention_mask = batch["attention_mask"].to(device)
             chunk_step = batch["chunk_step"].to(device)
 
             correction_target = action_expert - action_vla
 
-            # Compute features on-the-fly with frozen encoder
+            # Compute patch-level prediction error (frozen)
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                z_t = visual_encoder(frames_t)
-                z_t1 = visual_encoder(frames_t1)
+                z_t_patches = visual_encoder.forward_patches(frames_t)    # (B, 49, 384)
+                z_t1_patches = visual_encoder.forward_patches(frames_t1)  # (B, 49, 384)
 
-                # Self-attention forward model with full intent tokens
-                delta_z_predicted = forward_model(
-                    z_t.float(), proprio_t, intent_tokens, attention_mask
+                z_t1_pred = transition_vit(
+                    z_t_patches, proprio_t, intent_tokens, attention_mask
                 )
-                delta_z_actual = (z_t1 - z_t).float()
-                prediction_error = delta_z_actual - delta_z_predicted
 
-            # Correction prediction
+                # Per-patch prediction error
+                patch_error = (z_t1_patches - z_t1_pred).float()  # (B, 49, 384)
+
+            # Trainable: pooling + correction
+            prediction_error = error_pooling(patch_error)  # (B, 384)
+
             delta_a = correction_net(
                 prediction_error=prediction_error,
                 action_vla=action_vla,
@@ -238,7 +252,7 @@ def train_phase2(
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(correction_net.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
 
             train_loss += loss.item()
@@ -247,11 +261,13 @@ def train_phase2(
         scheduler.step()
         avg_train = train_loss / max(train_steps, 1)
 
-        # Validation
+        # === Validation ===
+        error_pooling.eval()
         correction_net.eval()
         val_loss = 0.0
         val_steps = 0
         val_correction_norms = []
+        val_pooling_weights = []
 
         with torch.no_grad():
             for batch in tqdm(
@@ -269,14 +285,15 @@ def train_phase2(
                 correction_target = action_expert - action_vla
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    z_t = visual_encoder(frames_t)
-                    z_t1 = visual_encoder(frames_t1)
+                    z_t_patches = visual_encoder.forward_patches(frames_t)
+                    z_t1_patches = visual_encoder.forward_patches(frames_t1)
 
-                delta_z_predicted = forward_model(
-                    z_t.float(), proprio_t, intent_tokens, attention_mask
-                )
-                delta_z_actual = (z_t1 - z_t).float()
-                prediction_error = delta_z_actual - delta_z_predicted
+                    z_t1_pred = transition_vit(
+                        z_t_patches, proprio_t, intent_tokens, attention_mask
+                    )
+                    patch_error = (z_t1_patches - z_t1_pred).float()
+
+                prediction_error = error_pooling(patch_error)
 
                 delta_a = correction_net(
                     prediction_error=prediction_error,
@@ -290,19 +307,27 @@ def train_phase2(
                 val_steps += 1
                 val_correction_norms.append(delta_a.norm(dim=-1))
 
+                # Track pooling attention weights
+                scores = error_pooling.score_mlp(patch_error)
+                weights = F.softmax(scores, dim=1).squeeze(-1)  # (B, 49)
+                val_pooling_weights.append(weights)
+
         avg_val = val_loss / max(val_steps, 1)
 
         all_norms = torch.cat(val_correction_norms)
         correction_cov = all_norms.std() / (all_norms.mean() + 1e-8)
 
+        # Pooling weight statistics
+        all_weights = torch.cat(val_pooling_weights)  # (N, 49)
+        weight_entropy = -(all_weights * (all_weights + 1e-8).log()).sum(dim=-1).mean()
+        top_patch = all_weights.mean(dim=0).argmax().item()
+
         log.info(
-            "Epoch %d/%d | Train loss=%.6f | Val loss=%.6f | Corr CoV=%.3f | LR=%.2e",
-            epoch + 1,
-            num_epochs,
-            avg_train,
-            avg_val,
-            correction_cov.item(),
-            scheduler.get_last_lr()[0],
+            "Epoch %d/%d | Train=%.6f | Val=%.6f | CoV=%.3f | "
+            "Entropy=%.2f TopPatch=%d | LR=%.2e",
+            epoch + 1, num_epochs,
+            avg_train, avg_val, correction_cov.item(),
+            weight_entropy.item(), top_patch, scheduler.get_last_lr()[0],
         )
 
         if use_wandb:
@@ -313,6 +338,8 @@ def train_phase2(
                     "val/correction_loss": avg_val,
                     "val/correction_l2_cov": correction_cov.item(),
                     "val/correction_l2_mean": all_norms.mean().item(),
+                    "val/pooling_entropy": weight_entropy.item(),
+                    "val/pooling_top_patch": top_patch,
                     "lr": scheduler.get_last_lr()[0],
                 },
                 step=epoch + 1,
@@ -320,13 +347,15 @@ def train_phase2(
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
+            torch.save(error_pooling.state_dict(), output_dir / "error_pooling_best.pt")
             torch.save(correction_net.state_dict(), output_dir / "correction_net_best.pt")
-            log.info("  -> Best correction model saved (val_loss=%.6f)", avg_val)
+            log.info("  -> Best model saved (val_loss=%.6f)", avg_val)
 
         if (epoch + 1) % 10 == 0:
             torch.save(
                 {
                     "epoch": epoch + 1,
+                    "error_pooling": error_pooling.state_dict(),
                     "correction_net": correction_net.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
@@ -335,6 +364,7 @@ def train_phase2(
                 output_dir / f"checkpoint_epoch{epoch + 1}.pt",
             )
 
+    torch.save(error_pooling.state_dict(), output_dir / "error_pooling_final.pt")
     torch.save(correction_net.state_dict(), output_dir / "correction_net_final.pt")
     log.info("Phase 2 training complete. Best val_loss=%.6f", best_val_loss)
 
@@ -345,7 +375,7 @@ def train_phase2(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    parser = argparse.ArgumentParser(description="Phase 2: Intent-conditioned correction training")
+    parser = argparse.ArgumentParser(description="Phase 2: Patch-level correction training (v2)")
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--intent_dir", type=str, required=True)
     parser.add_argument("--vla_action_dir", type=str, required=True)
@@ -355,16 +385,16 @@ if __name__ == "__main__":
     parser.add_argument("--action_dim", type=int, default=7)
     parser.add_argument("--proprio_dim", type=int, default=8)
     parser.add_argument("--intent_dim", type=int, default=2048)
+    parser.add_argument("--num_patches", type=int, default=49)
+    parser.add_argument("--transition_num_layers", type=int, default=4)
+    parser.add_argument("--transition_num_heads", type=int, default=8)
+    parser.add_argument("--transition_ffn_dim", type=int, default=1536)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--pooling_hidden_dim", type=int, default=128)
     parser.add_argument("--max_correction", type=float, default=0.15)
-    parser.add_argument(
-        "--forward_hidden_dim", type=int, default=256, help="(unused, kept for compat)"
-    )
-    parser.add_argument("--forward_num_layers", type=int, default=2, help="Self-attention layers")
-    parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--val_split", type=float, default=0.1)

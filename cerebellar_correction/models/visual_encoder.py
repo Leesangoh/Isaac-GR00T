@@ -70,22 +70,36 @@ class CerebellumVisualEncoder(nn.Module):
             std=[0.229, 0.224, 0.225],
         )
 
+    def _preprocess(self, image: torch.Tensor) -> torch.Tensor:
+        if image.shape[-2] != self.input_size or image.shape[-1] != self.input_size:
+            image = torch.nn.functional.interpolate(
+                image, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False
+            )
+        return self.norm(image)
+
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
             image: (B, 3, H, W) float32 in [0, 1]
         Returns:
-            z: (B, 384)
+            z: (B, 384) mean-pooled patch tokens
         """
-        # Resize to expected input size if needed (inference images may differ)
-        if image.shape[-2] != self.input_size or image.shape[-1] != self.input_size:
-            image = torch.nn.functional.interpolate(
-                image, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False
-            )
-        x = self.norm(image)
+        x = self._preprocess(image)
         features = self.backbone.forward_features(x)
         patch_tokens = features["x_norm_patchtokens"]  # (B, N_patches, 384)
         return patch_tokens.mean(dim=1)  # (B, 384)
+
+    def forward_patches(self, image: torch.Tensor) -> torch.Tensor:
+        """Return per-patch tokens for patch-level transition model.
+
+        Args:
+            image: (B, 3, H, W) float32 in [0, 1]
+        Returns:
+            patch_tokens: (B, N_patches, 384) — 49 patches for 98×98 input (7×7 grid)
+        """
+        x = self._preprocess(image)
+        features = self.backbone.forward_features(x)
+        return features["x_norm_patchtokens"]  # (B, 49, 384)
 
 
 class EMAEncoder:

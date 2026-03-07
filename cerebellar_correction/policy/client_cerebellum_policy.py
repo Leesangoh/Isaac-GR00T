@@ -21,7 +21,7 @@ from gr00t.policy.server_client import PolicyClient
 import numpy as np
 import torch
 
-from cerebellar_correction.models.cerebellum import CerebellumConfig, IntentCerebellumModule
+from cerebellar_correction.models.cerebellum import CerebellumConfig, PatchCerebellumModule
 
 
 log = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ class ClientSideCerebellumPolicy(BasePolicy):
 
         # Local cerebellum
         config = CerebellumConfig(max_correction=max_correction)
-        self.cerebellum = IntentCerebellumModule(config)
+        self.cerebellum = PatchCerebellumModule(config)
 
         ckpt_dir = Path(cerebellum_ckpt)
         assembled = ckpt_dir / "cerebellum_assembled.pt"
@@ -103,7 +103,7 @@ class ClientSideCerebellumPolicy(BasePolicy):
             phase1 = ckpt_dir
 
         for name, submod in [
-            ("forward_model_best.pt", self.cerebellum.forward_model),
+            ("transition_vit_best.pt", self.cerebellum.transition_vit),
             ("proprio_forward_best.pt", self.cerebellum.proprio_forward),
         ]:
             path = phase1 / name
@@ -113,11 +113,13 @@ class ClientSideCerebellumPolicy(BasePolicy):
         phase2 = ckpt_dir / "phase2"
         if not phase2.exists():
             phase2 = ckpt_dir
-        cn_path = phase2 / "correction_net_best.pt"
-        if cn_path.exists():
-            self.cerebellum.correction_net.load_state_dict(
-                torch.load(cn_path, map_location="cpu", weights_only=True)
-            )
+        for name, submod in [
+            ("error_pooling_best.pt", self.cerebellum.error_pooling),
+            ("correction_net_best.pt", self.cerebellum.correction_net),
+        ]:
+            path = phase2 / name
+            if path.exists():
+                submod.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
         log.info("Loaded cerebellum components from %s", ckpt_dir)
 
     def _extract_image(self, observation: dict[str, Any]) -> torch.Tensor:
