@@ -1,8 +1,10 @@
 from cerebellar_correction.models.cerebellum import CerebellumConfig, PatchCerebellumModule
 from cerebellar_correction.models.correction_net import AttentionWeightedPooling, CorrectionNetwork
 from cerebellar_correction.models.forward_model import (
+    ActionConditionedTransitionViT,
     IntentForwardModel,
     ProprioForwardModel,
+    SpatiotemporalTransitionViT,
     TransitionViT,
 )
 from cerebellar_correction.models.intent_extractor import IntentExtractor
@@ -14,6 +16,8 @@ __all__ = [
     "CerebellumVisualEncoder",
     "EMAEncoder",
     "TransitionViT",
+    "ActionConditionedTransitionViT",
+    "SpatiotemporalTransitionViT",
     "IntentForwardModel",
     "ProprioForwardModel",
     "AttentionWeightedPooling",

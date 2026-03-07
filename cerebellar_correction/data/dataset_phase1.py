@@ -12,6 +12,11 @@ Float32 conversion happens per-batch in the training loop.
 
 Frames are stored as uint8 HWC numpy arrays (~108GB for full BridgeData).
 Float conversion + CHW transpose happens per-sample in __getitem__.
+
+Experimental extensions (backward-compatible, disabled by default):
+  - chunk_size > 0: Stale intent — uses intent from chunk start, not per-timestep
+  - vla_dir: Loads expert actions for action-conditioned models
+  - history_len > 1: Returns H consecutive frames for spatiotemporal models
 """
 
 import json
@@ -45,6 +50,16 @@ class BridgePhase1Dataset(Dataset):
     load intent tokens from .npz files using parallel threads.
 
     Returns (frame_t, frame_t1, proprio_t, proprio_t1, intent_tokens, attention_mask).
+
+    Experimental modes (all backward-compatible):
+      - chunk_size > 0: Stale intent training. Intent for sample at timestep t
+        comes from chunk_start = (t // chunk_size) * chunk_size within the episode.
+        Simulates the train-inference mismatch where intent is extracted once
+        per action chunk and reused for all steps.
+      - vla_dir: Load expert actions from extract_all.py output. Returns
+        'action' (7-dim) alongside other fields for action-conditioned models.
+      - history_len > 1: Multi-frame history. Returns H consecutive frames
+        (clamped to episode boundaries) for spatiotemporal transition models.
     """
 
     def __init__(
@@ -55,22 +70,124 @@ class BridgePhase1Dataset(Dataset):
         image_size: int = 98,
         decode_workers: int = 32,
         cache_dir: str = "",
+        # === Experimental extensions ===
+        chunk_size: int = 0,
+        vla_dir: str = "",
+        history_len: int = 1,
     ):
+        self.chunk_size = chunk_size
+        self.history_len = max(history_len, 1)
+        self.vla_dir = Path(vla_dir) if vla_dir else None
+        self.actions = None  # populated by _load_actions if vla_dir is set
+
         intent_dir = Path(intent_dir)
         cache_dir = Path(cache_dir) if cache_dir else None
 
         if cache_dir and self._load_from_cache(cache_dir, intent_dir, proprio_dim, decode_workers):
-            return
+            pass  # loaded from cache
+        else:
+            # Full decode path (first run or no cache)
+            self._decode_and_build(
+                dataset_path, intent_dir, proprio_dim, image_size, decode_workers
+            )
+            # Save cache for next time
+            if cache_dir:
+                self._save_to_cache(cache_dir)
 
-        # Full decode path (first run or no cache)
-        self._decode_and_build(
-            dataset_path, intent_dir, proprio_dim, image_size, decode_workers
+        # Build episode boundary index for stale intent / multi-frame
+        self._build_episode_boundaries()
+
+        # Load expert actions if requested
+        if self.vla_dir:
+            self._load_actions(cache_dir)
+
+        # Log experimental mode info
+        if self.chunk_size > 0:
+            log.info("Stale intent enabled: chunk_size=%d", self.chunk_size)
+        if self.history_len > 1:
+            log.info("Multi-frame history enabled: H=%d", self.history_len)
+        if self.actions is not None:
+            log.info("Action-conditioned mode: action_dim=%d", self.actions.shape[1])
+
+    # ------------------------------------------------------------------
+    # Episode boundary tracking (for stale intent + multi-frame)
+    # ------------------------------------------------------------------
+    def _build_episode_boundaries(self):
+        """Build cumulative offset array for episode boundaries.
+
+        self._episode_starts[i] = first flat index of episode i.
+        self._episode_starts[n_episodes] = total_pairs (sentinel).
+        """
+        ep_order = self._episode_order
+        n_episodes = len(ep_order)
+        starts = np.zeros(n_episodes + 1, dtype=np.int64)
+        for i, (ep_id, n_pairs) in enumerate(ep_order):
+            starts[i + 1] = starts[i] + n_pairs
+        self._episode_starts = starts
+        log.info(
+            "Episode boundaries built: %d episodes, %d total pairs",
+            n_episodes, starts[-1],
         )
 
-        # Save cache for next time
-        if cache_dir:
-            self._save_to_cache(cache_dir)
+    def _get_episode_info(self, flat_idx: int) -> tuple[int, int, int]:
+        """Find episode index, episode start, and timestep within episode.
 
+        Returns: (episode_idx, ep_start_flat, timestep_in_episode)
+        """
+        ep_idx = int(np.searchsorted(self._episode_starts[1:], flat_idx, side="right"))
+        ep_start = int(self._episode_starts[ep_idx])
+        t_in_ep = flat_idx - ep_start
+        return ep_idx, ep_start, t_in_ep
+
+    # ------------------------------------------------------------------
+    # Action loading
+    # ------------------------------------------------------------------
+    def _load_actions(self, cache_dir: Path | None):
+        """Load expert actions from vla_dir .pt files into flat array.
+
+        Actions are cached to actions.npy in cache_dir for fast reload.
+        """
+        if self.vla_dir is None:
+            return
+
+        # Try loading from cache first
+        actions_cache = cache_dir / "actions.npy" if cache_dir else None
+        if actions_cache and actions_cache.exists():
+            log.info("Loading cached actions from %s...", actions_cache)
+            self.actions = torch.from_numpy(np.load(actions_cache))
+            log.info("Loaded %d actions from cache", len(self.actions))
+            return
+
+        action_dim = 7
+        total_pairs = len(self.frames_t)
+        actions = np.zeros((total_pairs, action_dim), dtype=np.float32)
+
+        offset = 0
+        loaded = 0
+        missing = 0
+        for ep_id, n_pairs in tqdm(self._episode_order, desc="Loading actions"):
+            pt_path = self.vla_dir / f"{ep_id}.pt"
+            if pt_path.exists():
+                data = torch.load(pt_path, map_location="cpu", weights_only=True)
+                action_expert = data["action_expert"].numpy()  # (T, 7)
+                n = min(n_pairs, len(action_expert))
+                actions[offset : offset + n] = action_expert[:n]
+                loaded += 1
+            else:
+                missing += 1
+            offset += n_pairs
+
+        self.actions = torch.from_numpy(actions)
+        log.info("Loaded actions: %d episodes, %d missing", loaded, missing)
+
+        # Cache for next time
+        if actions_cache:
+            np.save(actions_cache, actions)
+            log.info("Saved actions cache to %s", actions_cache)
+
+    # ------------------------------------------------------------------
+    # Cache loading (unchanged core, added episode_order storage)
+    # ------------------------------------------------------------------
     def _load_from_cache(
         self,
         cache_dir: Path,
@@ -121,9 +238,9 @@ class BridgePhase1Dataset(Dataset):
                      total_pairs * MAX_INTENT_TOKENS * INTENT_DIM * 2 / 1e9)
             intent_tokens_buf = np.load(intent_npy, mmap_mode="r")
         else:
-            # v1 → v2 upgrade: build intent_tokens.npy from individual .npz files
+            # v1 -> v2 upgrade: build intent_tokens.npy from individual .npz files
             log.info(
-                "Upgrading cache v1→v2: building intent_tokens.npy from %d episodes...",
+                "Upgrading cache v1->v2: building intent_tokens.npy from %d episodes...",
                 len(ep_order),
             )
             intent_tokens_buf = np.empty(
@@ -157,6 +274,7 @@ class BridgePhase1Dataset(Dataset):
         self.proprio_t1 = torch.from_numpy(proprio1_buf)
         self.intent_tokens = intent_tokens_buf
         self.attention_masks = attn_mask_buf
+        self._episode_order = ep_order  # store for boundary tracking
 
         log.info("Cache load complete: %d pairs", total_pairs)
         return True
@@ -329,7 +447,7 @@ class BridgePhase1Dataset(Dataset):
         self.proprio_t1 = torch.from_numpy(proprio1_buf)
         self.intent_tokens = intent_tokens_buf
         self.attention_masks = attn_mask_buf
-        self._episode_order = episode_order  # for cache saving
+        self._episode_order = episode_order  # for cache saving + boundary tracking
 
         log.info("Loaded %d pairs into RAM", total_pairs)
         log.info(
@@ -342,11 +460,44 @@ class BridgePhase1Dataset(Dataset):
         return len(self.frames_t)
 
     def __getitem__(self, idx):
-        return {
+        # --- Stale intent ---
+        if self.chunk_size > 0:
+            _ep_idx, ep_start, t_in_ep = self._get_episode_info(idx)
+            chunk_start_t = (t_in_ep // self.chunk_size) * self.chunk_size
+            intent_idx = ep_start + chunk_start_t
+        else:
+            intent_idx = idx
+            _ep_idx = ep_start = t_in_ep = None  # lazy compute if needed
+
+        sample = {
             "frame_t": torch.from_numpy(self.frames_t[idx].transpose(2, 0, 1).copy()),
             "frame_t1": torch.from_numpy(self.frames_t1[idx].transpose(2, 0, 1).copy()),
             "proprio_t": self.proprio_t[idx],
             "proprio_t1": self.proprio_t1[idx],
-            "intent_tokens": torch.from_numpy(self.intent_tokens[idx].copy()),
-            "attention_mask": torch.from_numpy(self.attention_masks[idx].copy()),
+            "intent_tokens": torch.from_numpy(self.intent_tokens[intent_idx].copy()),
+            "attention_mask": torch.from_numpy(self.attention_masks[intent_idx].copy()),
         }
+
+        # --- Chunk position (for stale intent analysis) ---
+        if self.chunk_size > 0:
+            sample["chunk_position"] = torch.tensor(t_in_ep - chunk_start_t, dtype=torch.long)
+
+        # --- Multi-frame history ---
+        if self.history_len > 1:
+            if ep_start is None:
+                _ep_idx, ep_start, t_in_ep = self._get_episode_info(idx)
+
+            history_frames = []
+            for h in range(self.history_len - 1, -1, -1):
+                hist_idx = max(idx - h, ep_start)
+                frame = self.frames_t[hist_idx].transpose(2, 0, 1).copy()
+                history_frames.append(torch.from_numpy(frame))
+
+            # (H, 3, height, width) — H frames from oldest to newest (current = last)
+            sample["history_frames"] = torch.stack(history_frames, dim=0)
+
+        # --- Expert action (for action-conditioned models) ---
+        if self.actions is not None:
+            sample["action"] = self.actions[idx]
+
+        return sample
