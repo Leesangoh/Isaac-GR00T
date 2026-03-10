@@ -49,6 +49,9 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    denoising_steps: int | None = None
+    """Override the number of flow-matching denoising steps (default: use model config, typically 4)."""
+
     save_attention_map: bool = False
     """Save cross-attention heatmaps from the DiT action head."""
 
@@ -78,6 +81,13 @@ def main(config: ServerConfig):
             save_attention_map=config.save_attention_map,
             attention_map_dir=config.attention_map_dir,
         )
+        if config.denoising_steps is not None:
+            for module in policy.model.modules():
+                if hasattr(module, "num_inference_timesteps"):
+                    original = module.num_inference_timesteps
+                    module.num_inference_timesteps = config.denoising_steps
+                    print(f"  Denoising steps: {original} -> {config.denoising_steps}")
+                    break
     elif config.dataset_path is not None:
         if config.modality_config_path is None:
             from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
