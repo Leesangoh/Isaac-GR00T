@@ -189,6 +189,60 @@ class FractionalCenterCrop(A.DualTransform):
         return ("crop_fraction",)
 
 
+def apply_spatial_replay_to_depth(depth_maps, replay, shortest_image_edge=256, crop_fraction=0.95):
+    """Apply the same spatial transforms (resize+crop) to depth maps using replay data.
+
+    Only applies SmallestMaxSize, FractionalRandomCrop, and SmallestMaxSize from replay,
+    skipping color jitter and rotation (which don't apply to depth).
+
+    Args:
+        depth_maps: np.ndarray [T, H, W] of depth frames (float32)
+        replay: replay data from ReplayCompose applied to RGB
+        shortest_image_edge: max size for SmallestMaxSize
+        crop_fraction: fraction for FractionalRandomCrop
+
+    Returns:
+        list of torch.Tensor [1, H_out, W_out] depth frames (float32)
+    """
+    # Build spatial-only transform matching the RGB pipeline (no color jitter/rotation)
+    spatial_transform = A.ReplayCompose([
+        A.SmallestMaxSize(max_size=shortest_image_edge, interpolation=cv2.INTER_AREA),
+        FractionalRandomCrop(crop_fraction=crop_fraction),
+        A.SmallestMaxSize(max_size=shortest_image_edge, interpolation=cv2.INTER_AREA),
+    ], p=1.0)
+
+    # Extract spatial replay params from the full replay
+    # The replay contains params for each transform in order:
+    # [SmallestMaxSize, FractionalRandomCrop, SmallestMaxSize, (Rotate), (ColorJitter)]
+    # We need to build a spatial-only replay with just the first 3 transforms
+    spatial_replay = {
+        "transforms": replay["transforms"][:3],  # first 3 are spatial
+        "__class_fullname__": replay["__class_fullname__"],
+        "applied": replay["applied"],
+        "params": replay.get("params", {}),
+    }
+
+    result = []
+    for i in range(len(depth_maps)):
+        # Depth is [H, W] float32, albumentations needs [H, W, C] or [H, W]
+        d = depth_maps[i]
+        if d.ndim == 2:
+            # Convert to [H, W, 1] for albumentations
+            d_3ch = np.stack([d, d, d], axis=-1)  # fake 3ch for compatibility
+        else:
+            d_3ch = np.stack([d] * 3, axis=-1)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            augmented = spatial_transform.replay(
+                image=d_3ch, saved_augmentations=spatial_replay
+            )
+        d_out = augmented["image"][:, :, 0]  # take first channel back
+        result.append(torch.from_numpy(d_out).unsqueeze(0).float())  # [1, H, W]
+
+    return result
+
+
 def build_image_transformations_albumentations(
     image_target_size,
     image_crop_size,

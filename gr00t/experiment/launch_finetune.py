@@ -88,5 +88,32 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    config.data.video_backend = ft_config.video_backend
+
+    # Gradient checkpointing
+    if ft_config.gradient_checkpointing:
+        config.training.gradient_checkpointing = True
+
+    # Override action horizon if specified
+    if ft_config.action_horizon is not None:
+        config.model.action_horizon = ft_config.action_horizon
+
+    # DepthMem configuration
+    if ft_config.depthmem_enabled:
+        T = ft_config.depthmem_num_temporal_frames
+        config.model.depthmem_enabled = True
+        config.model.depthmem_num_temporal_frames = T
+        config.data.depthmem_depth_dir = ft_config.depthmem_depth_dir
+        config.data.depthmem_num_temporal_frames = T
+        config.data.allow_padding = True  # needed for temporal window at episode start
+
+        # Override video delta_indices to load T temporal frames
+        if embodiment_tag in config.data.modality_configs:
+            video_cfg = config.data.modality_configs[embodiment_tag].get("video")
+            if video_cfg is not None:
+                video_cfg.delta_indices = list(range(-(T - 1), 1))
+                print(f"[DepthMem] Video delta_indices set to {video_cfg.delta_indices}")
+        config.model.depthmem_lora_rank = ft_config.depthmem_lora_rank
+        print(f"[DepthMem] Enabled: T={T}, depth_dir={ft_config.depthmem_depth_dir}, lora_rank={ft_config.depthmem_lora_rank}")
 
     run(config)

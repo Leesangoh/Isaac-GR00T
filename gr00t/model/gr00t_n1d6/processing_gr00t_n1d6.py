@@ -71,6 +71,12 @@ class Gr00tN1d6DataCollator:
         batch = {}
         keys = list(set().union(*(elem.keys() for elem in features)))
 
+        # DepthMem: collect depth maps before processing
+        depth_maps_list = []
+        for elem in features:
+            if "depth_maps" in elem.get("vlm_content", {}):
+                depth_maps_list.append(elem["vlm_content"].pop("depth_maps"))
+
         for key in keys:
             values = [elem[key] for elem in features if key in elem]
             if key == "vlm_content":
@@ -99,6 +105,22 @@ class Gr00tN1d6DataCollator:
             else:
                 # state, state_mask, action and action_mask - stack to form batch dimension
                 batch[key] = torch.from_numpy(np.stack(values))
+
+        # DepthMem: flatten depth maps to match pixel_values order
+        if depth_maps_list and "pixel_values" in batch:
+            flat_depth = []
+            for dm in depth_maps_list:
+                if isinstance(dm, np.ndarray) and dm.ndim == 3:
+                    # [T, H, W] -> list of T [H, W] arrays
+                    for i in range(len(dm)):
+                        flat_depth.append(dm[i])
+                else:
+                    flat_depth.append(dm)
+            batch["depth_maps"] = flat_depth
+            # Infer num_temporal_frames from first depth_maps entry
+            if isinstance(depth_maps_list[0], np.ndarray) and depth_maps_list[0].ndim == 3:
+                batch["num_temporal_frames"] = depth_maps_list[0].shape[0]
+
         return BatchFeature(data={"inputs": batch})
 
     def __str__(self):
@@ -374,6 +396,7 @@ class Gr00tN1d6Processor(BaseProcessor):
             images=content.images,
             image_transform=image_transform,
             language=language,
+            depth_maps=content.depth_maps,
         )
 
         transformed_inputs = {
@@ -394,6 +417,7 @@ class Gr00tN1d6Processor(BaseProcessor):
         images: list[Image.Image],
         image_transform: transforms.Compose | A.Compose,
         language: str,
+        depth_maps: "np.ndarray | None" = None,
     ):
         temporal_stacked_images = {}
 
@@ -429,6 +453,24 @@ class Gr00tN1d6Processor(BaseProcessor):
         )  # (T*V, C, H, W), Eagle processor expects numpy array
 
         vlm_inputs = self._apply_vlm_processing(stacked_images, language)
+
+        # DepthMem: apply same spatial transforms to depth maps, then attach
+        if depth_maps is not None:
+            if self.use_albumentations and replay is not None:
+                from gr00t.model.gr00t_n1d6.image_augmentations import (
+                    apply_spatial_replay_to_depth,
+                )
+
+                transformed_depth = apply_spatial_replay_to_depth(
+                    depth_maps,
+                    replay,
+                    shortest_image_edge=self.shortest_image_edge or 256,
+                    crop_fraction=self.crop_fraction or 0.95,
+                )
+                # Stack back to [T, H, W]
+                depth_maps = np.stack([d.squeeze(0).numpy() for d in transformed_depth])
+            vlm_inputs["vlm_content"]["depth_maps"] = depth_maps
+
         return vlm_inputs
 
     def save_pretrained(self, save_directory: str | Path) -> list[Path]:

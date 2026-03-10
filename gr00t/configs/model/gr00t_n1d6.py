@@ -101,6 +101,17 @@ class Gr00tN1d6Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # DepthMem parameters
+    depthmem_enabled: bool = False  # Enable depth channel + temporal attention
+    depthmem_num_channels: int = 4  # RGB(3) + Depth(1)
+    depthmem_num_temporal_frames: int = 16  # 15 past + 1 current
+    depthmem_temporal_attention_layers: list = field(
+        default_factory=lambda: [7, 14, 21, 26]
+    )
+    depthmem_lora_rank: int = 16  # LoRA rank for SigLIP2 + Qwen3 (0 = no LoRA)
+    depthmem_depth_model_size: str = "small"  # VDA model size
+    depthmem_depth_resolution: int = 224
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

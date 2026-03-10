@@ -92,6 +92,10 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                     )
                 logging.info("mask_token not in checkpoint - initialized")
 
+            # DepthMem: expand patch embedding and enable temporal attention
+            if getattr(self.config.model, "depthmem_enabled", False):
+                self._enable_depthmem(model)
+
         else:
             model = self.model_class(
                 self.config.model, transformers_loading_kwargs=self.transformers_loading_kwargs
@@ -111,6 +115,74 @@ class Gr00tN1d6Pipeline(ModelPipeline):
         print("Model: ", model)
 
         return model
+
+    def _enable_depthmem(self, model):
+        """Enable DepthMem: expand patch embeddings 3ch→4ch, configure temporal attention, add LoRA.
+
+        After loading from a 3ch checkpoint, this method:
+        1. Updates the vision config for 4ch + temporal attention
+        2. Replaces the 3ch patch_embedding Linear with a 4ch version (RGB weights copied, depth zero-init)
+        3. Updates encoder temporal_attention_layers
+        4. Applies LoRA to SigLIP2 vision encoder and Qwen3 LLM
+        """
+        T = self.config.model.depthmem_num_temporal_frames
+        temporal_layers = getattr(self.config.model, "depthmem_temporal_attention_layers", [7, 14, 21, 26])
+        lora_rank = getattr(self.config.model, "depthmem_lora_rank", 16)
+        patch_size = 14
+        rgb_dim = 3 * patch_size * patch_size  # 588
+        rgbd_dim = 4 * patch_size * patch_size  # 784
+
+        # Step 1: Update vision_config on the Eagle sub-model
+        # Path: backbone.model.vision_model.vision_model (Siglip2VisionModel wraps inner model)
+        vision_model = model.backbone.model.vision_model.vision_model
+        vision_config = vision_model.config
+        vision_config.num_channels = 4
+        vision_config.num_temporal_frames = T
+        vision_config.temporal_attention_layers = temporal_layers
+
+        # Step 2: Replace patch_embedding Linear (3ch→4ch)
+        embeddings = vision_model.embeddings
+        old_patch = embeddings.patch_embedding  # nn.Linear(588, hidden_dim)
+        hidden_dim = old_patch.out_features
+        has_bias = old_patch.bias is not None
+
+        new_patch = torch.nn.Linear(rgbd_dim, hidden_dim, bias=has_bias)
+        with torch.no_grad():
+            new_patch.weight.data[:, :rgb_dim] = old_patch.weight.data
+            new_patch.weight.data[:, rgb_dim:] = 0  # zero-init depth channel
+            if has_bias:
+                new_patch.bias.data.copy_(old_patch.bias.data)
+        new_patch = new_patch.to(dtype=old_patch.weight.dtype, device=old_patch.weight.device)
+        embeddings.patch_embedding = new_patch
+        logging.info(f"[DepthMem] Expanded patch_embedding: {rgb_dim}→{rgbd_dim} (depth zero-init)")
+
+        # Step 3: Update encoder's temporal_attention_layers set
+        # (the encoder caches this from config at __init__, so we update it directly)
+        encoder = vision_model.encoder
+        encoder.temporal_attention_layers = set(temporal_layers)
+        logging.info(
+            f"[DepthMem] Temporal attention enabled at layers {temporal_layers} with T={T}"
+        )
+
+        # Step 4: Apply LoRA to vision encoder and LLM
+        if lora_rank > 0:
+            eagle_model = model.backbone.model
+            eagle_model.wrap_backbone_lora(
+                r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.05
+            )
+            logging.info(f"[DepthMem] Vision LoRA applied (rank={lora_rank})")
+
+            eagle_model.wrap_llm_lora(
+                r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.05
+            )
+            logging.info(f"[DepthMem] LLM LoRA applied (rank={lora_rank})")
+
+            # Ensure patch_embedding stays trainable (PEFT freezes base model params)
+            # Find patch_embedding in the PEFT-wrapped vision model
+            for name, param in eagle_model.vision_model.named_parameters():
+                if "patch_embedding" in name:
+                    param.requires_grad = True
+                    logging.info(f"[DepthMem] Kept {name} trainable")
 
     def _get_statistics(self) -> dict[str, dict[str, dict[str, dict[str, list[float]]]]] | None:
         return None

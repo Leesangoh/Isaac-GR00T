@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: float = 0.1,
         seed: int = 42,
         allow_padding: bool = False,
+        depth_dir: str | None = None,
+        num_temporal_frames: int = 1,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -134,6 +137,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
         self.allow_padding = allow_padding
+        self.depth_dir = depth_dir
+        self.num_temporal_frames = num_temporal_frames
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
@@ -214,7 +219,9 @@ class ShardedSingleStepDataset(ShardedDataset):
         """Return the number of shards in the dataset."""
         return len(self.shard_lengths)
 
-    def get_datapoint(self, episode_data: pd.DataFrame, step_index: int) -> dict:
+    def get_datapoint(
+        self, episode_data: pd.DataFrame, step_index: int, episode_index: int | None = None
+    ) -> dict:
         """
         Extract and process a single timestep from episode data.
 
@@ -224,6 +231,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         Args:
             episode_data: Complete episode DataFrame from LeRobotEpisodeLoader
             step_index: Timestep index within the episode to extract
+            episode_index: Original episode index (for depth map loading)
 
         Returns:
             Processed datapoint ready for model training
@@ -235,6 +243,33 @@ class ShardedSingleStepDataset(ShardedDataset):
         vla_step_data = extract_step_data(
             episode_data, step_index, self.modality_configs, self.embodiment_tag, self.allow_padding
         )
+
+        # DepthMem: load precomputed depth maps for T temporal frames
+        if self.depth_dir and episode_index is not None and self.num_temporal_frames > 1:
+            chunk_idx = episode_index // self.episode_loader.chunk_size
+            T = self.num_temporal_frames
+            ep_len = len(episode_data)
+            depth_frames = []
+            for delta in range(-(T - 1), 1):
+                frame_idx = max(0, min(step_index + delta, ep_len - 1))
+                depth_path = os.path.join(
+                    self.depth_dir,
+                    f"chunk-{chunk_idx:03d}",
+                    f"episode_{episode_index:06d}",
+                    f"frame_{frame_idx:06d}.npy",
+                )
+                if os.path.exists(depth_path):
+                    depth_frames.append(np.load(depth_path).astype(np.float32))
+                else:
+                    import logging
+
+                    logging.warning(f"Depth file not found: {depth_path}, using zeros")
+                    # Use same shape as existing depth frames, or default to 256x256
+                    fallback_shape = depth_frames[-1].shape if depth_frames else (256, 256)
+                    depth_frames.append(np.zeros(fallback_shape, dtype=np.float32))
+            vla_step_data.depth_maps = np.stack(depth_frames)  # [T, H, W]
+            vla_step_data.num_temporal_frames = T
+
         # Apply processor to convert to model inputs
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
         return self.processor(messages)
@@ -261,8 +296,12 @@ class ShardedSingleStepDataset(ShardedDataset):
         for ep_idx, step_indices in episodes:
             # Load episode data once per episode in shard
             episode_data = self.episode_loader[ep_idx]
+            # Get actual episode_index from metadata for depth map path lookup
+            actual_ep_idx = self.episode_loader.episodes_metadata[ep_idx]["episode_index"]
             for step_index in step_indices:
-                datapoints.append(self.get_datapoint(episode_data, step_index))
+                datapoints.append(
+                    self.get_datapoint(episode_data, step_index, episode_index=actual_ep_idx)
+                )
         return datapoints
 
     def get_dataset_statistics(self) -> dict:

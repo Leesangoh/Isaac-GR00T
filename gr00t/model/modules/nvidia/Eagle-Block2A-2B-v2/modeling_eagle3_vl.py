@@ -185,17 +185,19 @@ class Eagle3_VLForConditionalGeneration(Eagle3_VLPreTrainedModel, GenerationMixi
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            num_temporal_frames: int = 1,
+            temporal_kv_cache: Optional[dict] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         input_embeds = self.language_model.get_input_embeddings()(input_ids)
 
         num_images = len(pixel_values)
-        
+
         if image_flags is not None:
             image_flags = image_flags.view(-1)
 
-        vit_embeds = self.extract_feature(pixel_values, image_flags)
+        vit_embeds = self.extract_feature(pixel_values, image_flags, num_temporal_frames=num_temporal_frames, temporal_kv_cache=temporal_kv_cache)
 
 
         B, N, C = input_embeds.shape
@@ -304,13 +306,15 @@ class Eagle3_VLForConditionalGeneration(Eagle3_VLPreTrainedModel, GenerationMixi
 
         return valid_tokens
     
-    def extract_feature(self, pixel_values, image_flags=None):
+    def extract_feature(self, pixel_values, image_flags=None, num_temporal_frames=1, temporal_kv_cache=None):
 
         if self.select_layer == -1:
             vision_model_output = self.vision_model(
                 pixel_values=pixel_values,
                 output_hidden_states=False,
-                return_dict=True)
+                return_dict=True,
+                num_temporal_frames=num_temporal_frames,
+                temporal_kv_cache=temporal_kv_cache)
             if hasattr(vision_model_output, 'last_hidden_state'):
                 vit_embeds = vision_model_output.last_hidden_state
             if hasattr(vision_model_output, 'spatial_shapes'):
@@ -319,7 +323,9 @@ class Eagle3_VLForConditionalGeneration(Eagle3_VLPreTrainedModel, GenerationMixi
             vit_embeds = self.vision_model(
                 pixel_values=pixel_values,
                 output_hidden_states=True,
-                return_dict=True).hidden_states[self.select_layer]
+                return_dict=True,
+                num_temporal_frames=num_temporal_frames,
+                temporal_kv_cache=temporal_kv_cache).hidden_states[self.select_layer]
 
         vit_embeds, spatial_shapes = self.pixel_shuffle_back(vit_embeds, spatial_shapes)
 
@@ -328,13 +334,13 @@ class Eagle3_VLForConditionalGeneration(Eagle3_VLPreTrainedModel, GenerationMixi
             vit_embeds = cp.checkpoint(self.mlp1, vit_embeds)
         else:
             vit_embeds = self.mlp1(vit_embeds)
-        
+
         B, N, C = vit_embeds.shape
         vit_embeds = vit_embeds.reshape(B * N, C)
-        
+
         if image_flags is not None and any(image_flags==0):
             vit_embeds = self.mask_valid_tokens(vit_embeds, spatial_shapes, image_flags)
-            
+
         return vit_embeds
 
     @torch.no_grad()

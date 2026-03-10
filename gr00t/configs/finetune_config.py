@@ -116,3 +116,25 @@ class FinetuneConfig:
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+
+    gradient_checkpointing: bool = False
+    """Enable gradient checkpointing to reduce memory usage at the cost of speed."""
+
+    action_horizon: int | None = None
+    """Override the action horizon (action chunk size). If None, use model default."""
+
+    video_backend: str = "torchcodec"
+    """Video decoding backend. Use 'ffmpeg' for AV1-encoded datasets (e.g., bridge)."""
+
+    # --- DepthMem Configuration ---
+    depthmem_enabled: bool = False
+    """Enable DepthMem: 4ch RGBD input + temporal attention in SigLIP2."""
+
+    depthmem_depth_dir: str | None = None
+    """Path to precomputed depth maps directory."""
+
+    depthmem_num_temporal_frames: int = 16
+    """Number of temporal frames (past + current) for temporal attention."""
+
+    depthmem_lora_rank: int = 16
+    """LoRA rank for SigLIP2 vision encoder and Qwen3 LLM. 0 to disable LoRA."""

@@ -46,6 +46,27 @@ from math import isqrt
 from typing import Dict
 
 
+def get_sinusoidal_temporal_encoding(num_frames: int, dim: int) -> torch.Tensor:
+    """
+    Fixed sinusoidal encoding for temporal positions (MEM-style).
+    Current frame (last frame, t=0) -> encoding = 0 (preserves single-frame behavior).
+    Past frames -> non-zero encoding.
+
+    Returns: [num_frames, dim]
+    """
+    # positions: [T-1, T-2, ..., 1, 0] where 0 = current frame
+    positions = torch.arange(num_frames - 1, -1, -1).float()  # [T]
+    div_term = torch.exp(torch.arange(0, dim, 2).float() * -(math.log(10000.0) / dim))
+
+    encoding = torch.zeros(num_frames, dim)
+    for i in range(num_frames):
+        pos = positions[i]
+        if pos > 0:  # past frames only; current frame stays 0
+            encoding[i, 0::2] = torch.sin(pos * div_term)
+            encoding[i, 1::2] = torch.cos(pos * div_term)
+    return encoding
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -289,10 +310,13 @@ class Siglip2VisionConfig(PretrainedConfig):
         hidden_act="gelu_pytorch_tanh",
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
-        window_size=14, # 
+        window_size=14, #
         full_attention_indexes=[7, 14, 21, 26],
         use_rope=True,
         use_windows_attn=True,
+        # DepthMem temporal attention config
+        num_temporal_frames=1,
+        temporal_attention_layers=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -311,6 +335,9 @@ class Siglip2VisionConfig(PretrainedConfig):
         self.full_attention_indexes = full_attention_indexes
         self.use_windows_attn = use_windows_attn
         self.use_rope = use_rope
+        # DepthMem: temporal attention settings
+        self.num_temporal_frames = num_temporal_frames
+        self.temporal_attention_layers = temporal_attention_layers if temporal_attention_layers is not None else []
 
 
 @dataclass
@@ -883,6 +910,114 @@ class Siglip2EncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = Siglip2MLP(config)
 
+    def _temporal_attention(
+        self,
+        hidden_states: torch.Tensor,
+        num_temporal_frames: int,
+        win_meta_list: Optional[List[Dict]] = None,
+        temporal_kv_cache: Optional[dict] = None,
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        MEM-style temporal attention: per-patch causal attention across frames.
+        Reuses spatial attention QKV weights (no new learnable parameters).
+
+        Works with the packed format used by SigLIP2 encoder:
+          hidden_states: [1, sum(patches_per_image), D] where images are from B*T frames.
+
+        Each batch item has T consecutive frames. Temporal attention is applied
+        across the T frames for each spatial patch position independently.
+
+        Args:
+            hidden_states: [1, total_patches, D] packed format.
+            num_temporal_frames: T
+            win_meta_list: window meta for determining per-image patch counts.
+        Returns:
+            temporal output: [1, total_patches, D] (same packed format, additive residual)
+        """
+        _, total_patches, D = hidden_states.shape
+        T = num_temporal_frames
+
+        # Compute patches per image from win_meta_list
+        img_patch_counts = defaultdict(int)
+        for wm in win_meta_list:
+            img_patch_counts[wm['img_idx']] += wm['win_hw'][0] * wm['win_hw'][1]
+        num_images = len(img_patch_counts)
+        patches_per_img = [img_patch_counts[i] for i in range(num_images)]
+
+        B = num_images // T
+
+        # For temporal attention, all frames must have the same number of patches
+        # (which is the case since they come from the same camera/resolution)
+        N = patches_per_img[0]
+        assert all(p == N for p in patches_per_img), (
+            f"All frames must have same patch count for temporal attention, got {patches_per_img}"
+        )
+
+        # Split packed sequence into per-image segments: [num_images, N, D]
+        x = hidden_states.squeeze(0)  # [total_patches, D]
+        x = x.view(num_images, N, D)  # [B*T, N, D]
+
+        # Reshape to [B, T, N, D]
+        x = x.view(B, T, N, D)
+
+        # Add sinusoidal temporal position encoding
+        temp_enc = get_sinusoidal_temporal_encoding(T, D).to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )  # [T, D]
+        x = x + temp_enc[None, :, None, :]  # broadcast over B and N
+
+        # Per-patch temporal attention: reshape to [B*N, T, D]
+        x = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
+
+        # Reuse spatial attention's QKV weights
+        num_heads = self.self_attn.num_heads
+        head_dim = self.self_attn.head_dim
+        scale = self.self_attn.scale
+
+        q = self.self_attn.q_proj(x)  # [B*N, T, D]
+        k = self.self_attn.k_proj(x)
+        v = self.self_attn.v_proj(x)
+
+        # Handle KV cache for inference
+        if temporal_kv_cache is not None and layer_idx is not None:
+            cache_key = f"layer_{layer_idx}"
+            if cache_key in temporal_kv_cache:
+                cached_k, cached_v = temporal_kv_cache[cache_key]
+                k = torch.cat([cached_k, k], dim=1)
+                v = torch.cat([cached_v, v], dim=1)
+            temporal_kv_cache[cache_key] = (k.detach(), v.detach())
+
+        q = q.view(B * N, -1, num_heads, head_dim).transpose(1, 2)  # [B*N, H, T_q, d]
+        k = k.view(B * N, -1, num_heads, head_dim).transpose(1, 2)  # [B*N, H, T_kv, d]
+        v = v.view(B * N, -1, num_heads, head_dim).transpose(1, 2)
+
+        T_q = q.shape[2]
+        T_kv = k.shape[2]
+
+        # Causal mask: frame t can attend to frames 0..t only
+        causal_mask = torch.triu(
+            torch.ones(T_q, T_kv, device=hidden_states.device, dtype=torch.bool),
+            diagonal=T_kv - T_q + 1,
+        )
+        attn_mask = torch.zeros(T_q, T_kv, device=hidden_states.device, dtype=hidden_states.dtype)
+        attn_mask.masked_fill_(causal_mask, float("-inf"))
+
+        attn_weights = torch.matmul(q, k.transpose(-1, -2)) * scale
+        attn_weights = attn_weights + attn_mask[None, None, :, :]
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+
+        attn_output = torch.matmul(attn_weights, v)  # [B*N, H, T_q, d]
+        attn_output = attn_output.transpose(1, 2).reshape(B * N, T_q, D)
+
+        attn_output = self.self_attn.out_proj(attn_output)
+
+        # Reshape back to packed format: [B*N, T, D] -> [B, T, N, D] -> [1, B*T*N, D]
+        attn_output = attn_output.reshape(B, N, T_q, D)
+        attn_output = attn_output.permute(0, 2, 1, 3).reshape(1, B * T_q * N, D)
+
+        return attn_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -890,16 +1025,19 @@ class Siglip2EncoderLayer(nn.Module):
         rope_freqs_cis: Optional[torch.Tensor] = None,
         win_meta_list: Optional[List[Dict]] = None,
         windows_attn: Optional[bool] = False,
+        do_temporal_attention: bool = False,
+        num_temporal_frames: int = 1,
+        temporal_kv_cache: Optional[dict] = None,
+        layer_idx: Optional[int] = None,
     ) -> Tuple[torch.FloatTensor]:
         """
         Args:
             hidden_states (`torch.FloatTensor`):
                 Input to the layer of shape `(batch, seq_len, embed_dim)`.
-            attention_mask (`torch.FloatTensor`):
-                Attention mask of shape `(batch, 1, q_len, k_v_seq_len)` where padding elements are indicated by very large negative values.
-            output_attentions (`bool`, *optional*, defaults to `False`):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
+            do_temporal_attention: whether to apply temporal attention at this layer.
+            num_temporal_frames: T (number of temporal frames).
+            temporal_kv_cache: optional dict for KV caching during inference.
+            layer_idx: layer index for cache key.
         """
         residual = hidden_states
 
@@ -912,6 +1050,16 @@ class Siglip2EncoderLayer(nn.Module):
             windows_attn=windows_attn,
         )
         hidden_states = residual + hidden_states
+
+        # DepthMem: additive temporal attention (MEM-style)
+        if do_temporal_attention and num_temporal_frames > 1:
+            temporal_out = self._temporal_attention(
+                hidden_states, num_temporal_frames,
+                win_meta_list=win_meta_list,
+                temporal_kv_cache=temporal_kv_cache,
+                layer_idx=layer_idx,
+            )
+            hidden_states = hidden_states + temporal_out
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
@@ -945,8 +1093,10 @@ class Siglip2Encoder(nn.Module):
         self.layers = nn.ModuleList([Siglip2EncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
         self.full_attention_indexes = config.full_attention_indexes
-        
- 
+        # DepthMem: layers where temporal attention is applied
+        self.temporal_attention_layers = set(getattr(config, "temporal_attention_layers", []))
+
+
     # Ignore copy
     @can_return_tuple
     def forward(
@@ -956,28 +1106,14 @@ class Siglip2Encoder(nn.Module):
         output_hidden_states: Optional[bool] = None,
         win_meta_list: Optional[List[Dict]] = None,
         spatial_shapes: Optional[torch.Tensor] = None,
+        num_temporal_frames: int = 1,
+        temporal_kv_cache: Optional[dict] = None,
     ) -> BaseModelOutput:
         r"""
         Args:
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
-                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
-                than the model's internal embedding lookup matrix.
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-                for more detail.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+            inputs_embeds: [B*T, seq_len, hidden_size] or [1, seq_len, hidden_size]
+            num_temporal_frames: T (number of temporal frames, 1 = no temporal).
+            temporal_kv_cache: optional dict for inference-time KV caching.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -986,17 +1122,19 @@ class Siglip2Encoder(nn.Module):
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
-        
+
         rope_freqs_cis = self.rope_2d.get_freqs_cis(win_meta_list=win_meta_list, device=inputs_embeds.device)
 
         hidden_states = inputs_embeds
         for win_idx, encoder_layer in enumerate(self.layers):
-            
+
             if win_idx not in self.full_attention_indexes:
                 windows_attn = True
             else:
                 windows_attn = False
-                
+
+            do_temporal = win_idx in self.temporal_attention_layers
+
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
@@ -1006,7 +1144,11 @@ class Siglip2Encoder(nn.Module):
                     output_attentions,
                     rope_freqs_cis,
                     win_meta_list,
-                    windows_attn
+                    windows_attn,
+                    do_temporal,
+                    num_temporal_frames,
+                    None,  # no KV cache during training
+                    win_idx,
                 )
             else:
                 layer_outputs = encoder_layer(
@@ -1014,7 +1156,11 @@ class Siglip2Encoder(nn.Module):
                     output_attentions=output_attentions,
                     rope_freqs_cis=rope_freqs_cis,
                     win_meta_list=win_meta_list,
-                    windows_attn=windows_attn
+                    windows_attn=windows_attn,
+                    do_temporal_attention=do_temporal,
+                    num_temporal_frames=num_temporal_frames,
+                    temporal_kv_cache=temporal_kv_cache,
+                    layer_idx=win_idx,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1078,10 +1224,17 @@ class Siglip2VisionTransformer(nn.Module):
         pixel_values: torch.FloatTensor,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        num_temporal_frames: int = 1,
+        temporal_kv_cache: Optional[dict] = None,
     ) -> BaseModelOutputWithPooling:
         r"""
+        Args:
+            pixel_values: list of tensors, each [B*T, C, H, W] (or [B, C, H, W] when T=1).
+            num_temporal_frames: T. When T>1, pixel_values contains B*T images.
+                After encoding, past frame tokens are dropped, only current frame tokens returned.
+            temporal_kv_cache: optional dict for inference KV caching.
         Returns:
-
+            Siglip2VisionOutput with last_hidden_state [B, num_patches, hidden_size] (current frame only when T>1).
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1089,18 +1242,48 @@ class Siglip2VisionTransformer(nn.Module):
         )
 
         windows_tensor, win_meta_list, spatial_shapes, reverse_mapping = self.embeddings(pixel_values)
-        
+
         encoder_outputs: BaseModelOutput = self.encoder(
             inputs_embeds=windows_tensor,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             win_meta_list=win_meta_list,
             spatial_shapes=spatial_shapes,
+            num_temporal_frames=num_temporal_frames,
+            temporal_kv_cache=temporal_kv_cache,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
         last_hidden_state = self.post_layernorm(last_hidden_state)
         last_hidden_state = last_hidden_state[:, reverse_mapping, :]
+
+        # DepthMem: drop past frame tokens, keep only current frame
+        if num_temporal_frames > 1:
+            # last_hidden_state: [1, B*T*num_patches, D] (packed format)
+            # spatial_shapes contains B*T entries. We need the last B entries (current frame).
+            total_images = spatial_shapes.shape[0]
+            B = total_images // num_temporal_frames
+            patches_per_image = spatial_shapes[:, 0] * spatial_shapes[:, 1]
+
+            # Select only current frame (last frame per batch item)
+            # Images are ordered: [b0_t0, b0_t1, ..., b0_tT-1, b1_t0, ..., b1_tT-1, ...]
+            # Current frame is at index T-1, 2T-1, 3T-1, ...
+            current_indices = []
+            offset = 0
+            for img_idx in range(total_images):
+                n_patches = patches_per_image[img_idx].item()
+                # Check if this is a current frame (last in each T-frame group)
+                if (img_idx + 1) % num_temporal_frames == 0:
+                    current_indices.extend(range(offset, offset + n_patches))
+                offset += n_patches
+
+            current_indices = torch.tensor(current_indices, device=last_hidden_state.device, dtype=torch.long)
+            last_hidden_state = last_hidden_state[:, current_indices, :]
+
+            # Update spatial_shapes to only contain current frame shapes
+            current_frame_indices = list(range(num_temporal_frames - 1, total_images, num_temporal_frames))
+            spatial_shapes = spatial_shapes[current_frame_indices]
+
         return Siglip2VisionOutput(
             last_hidden_state=last_hidden_state,
             hidden_states=encoder_outputs.hidden_states,
@@ -1384,6 +1567,8 @@ class Siglip2VisionModel(Siglip2PreTrainedModel):
         pixel_values: torch.FloatTensor,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        num_temporal_frames: int = 1,
+        temporal_kv_cache: Optional[dict] = None,
     ) -> BaseModelOutputWithPooling:
         r"""
         Returns:
@@ -1411,6 +1596,8 @@ class Siglip2VisionModel(Siglip2PreTrainedModel):
             pixel_values=pixel_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            num_temporal_frames=num_temporal_frames,
+            temporal_kv_cache=temporal_kv_cache,
         )
 
 

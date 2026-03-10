@@ -7,6 +7,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Beta
@@ -14,6 +15,41 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
 import tree
+
+
+def expand_patch_embedding_for_depth(state_dict: dict, patch_size: int = 14) -> dict:
+    """Expand pre-trained 3ch patch embedding weights to 4ch (RGB+Depth).
+
+    The depth channel's weights are zero-initialized so the model starts
+    with identical behavior to the original 3ch model.
+
+    Args:
+        state_dict: Model state dict to modify in-place.
+        patch_size: Patch size (default 14 for SigLIP2).
+    Returns:
+        Modified state_dict.
+    """
+    rgb_dim = 3 * patch_size * patch_size  # 588
+    rgbd_dim = 4 * patch_size * patch_size  # 784
+
+    expanded_keys = []
+    for key in list(state_dict.keys()):
+        if "patch_embedding.weight" in key:
+            old_w = state_dict[key]
+            if old_w.shape[1] == rgb_dim:
+                new_w = torch.zeros(
+                    old_w.shape[0], rgbd_dim, dtype=old_w.dtype, device=old_w.device
+                )
+                new_w[:, :rgb_dim] = old_w
+                # Depth portion (new_w[:, rgb_dim:]) stays zero
+                state_dict[key] = new_w
+                expanded_keys.append(key)
+        elif "patch_embedding.bias" in key:
+            pass  # Bias doesn't depend on input channels
+
+    if expanded_keys:
+        print(f"[DepthMem] Expanded patch embedding: {expanded_keys} (3ch -> 4ch, depth zero-init)")
+    return state_dict
 
 
 class Gr00tN1d6ActionHead(nn.Module):
@@ -478,6 +514,14 @@ class Gr00tN1d6(PreTrainedModel):
             inputs.pop("vlm_content")
             inputs.update(prep)
 
+        # DepthMem: concatenate depth channel to pixel_values if present
+        if "depth_maps" in inputs and "pixel_values" in inputs:
+            inputs = self._concat_depth_to_pixel_values(inputs)
+
+        # DepthMem: ensure num_temporal_frames is in inputs for backbone
+        if self.config.depthmem_enabled and "num_temporal_frames" not in inputs:
+            inputs["num_temporal_frames"] = self.config.depthmem_num_temporal_frames
+
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
 
@@ -492,6 +536,49 @@ class Gr00tN1d6(PreTrainedModel):
         action_inputs = tree.map_structure(to_device_with_dtype, action_inputs)
 
         return backbone_inputs, action_inputs
+
+    def _concat_depth_to_pixel_values(self, inputs: dict) -> dict:
+        """Concatenate depth maps as 4th channel to pixel_values tensors.
+
+        pixel_values is a list of tensors, each [B_i, 3, H, W].
+        depth_maps is a list of depth arrays matching the images.
+        Result: each pixel_values tensor becomes [B_i, 4, H, W].
+        """
+        pixel_values = inputs["pixel_values"]
+        depth_maps = inputs.pop("depth_maps")
+
+        if not depth_maps:
+            return inputs
+
+        # pixel_values is a list of tensors grouped by size
+        new_pixel_values = []
+        depth_idx = 0
+        for pv_tensor in pixel_values:
+            B_i, C, H, W = pv_tensor.shape
+            # Get corresponding depth maps and resize to match
+            depth_batch = []
+            for b in range(B_i):
+                if depth_idx < len(depth_maps):
+                    d = depth_maps[depth_idx]
+                    if isinstance(d, np.ndarray):
+                        d = torch.from_numpy(d).float()
+                    if d.ndim == 2:
+                        d = d.unsqueeze(0)  # [1, H_d, W_d]
+                    # Resize depth to match pixel_values spatial size
+                    d = F.interpolate(d.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False).squeeze(0)
+                    depth_batch.append(d)
+                    depth_idx += 1
+                else:
+                    # If no depth available, use zeros
+                    depth_batch.append(torch.zeros(1, H, W, dtype=pv_tensor.dtype))
+
+            depth_tensor = torch.stack(depth_batch).to(dtype=pv_tensor.dtype, device=pv_tensor.device)
+            # Concatenate: [B_i, 3, H, W] + [B_i, 1, H, W] -> [B_i, 4, H, W]
+            new_pv = torch.cat([pv_tensor, depth_tensor], dim=1)
+            new_pixel_values.append(new_pv)
+
+        inputs["pixel_values"] = new_pixel_values
+        return inputs
 
     def forward(self, inputs: dict) -> BatchFeature:
         """

@@ -56,6 +56,8 @@ class DatasetFactory:
                     episode_sampling_rate=self.config.data.episode_sampling_rate,
                     seed=self.config.data.seed,
                     allow_padding=self.config.data.allow_padding,
+                    depth_dir=self.config.data.depthmem_depth_dir,
+                    num_temporal_frames=self.config.data.depthmem_num_temporal_frames,
                 )
                 datasets.append(dataset)
             dataset_lengths = np.array([len(dataset) for dataset in datasets])

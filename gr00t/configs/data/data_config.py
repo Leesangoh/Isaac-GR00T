@@ -78,3 +78,7 @@ class DataConfig:
     image_crop_size: List[int] = field(default_factory=lambda: [244, 244])
     image_target_size: List[int] = field(default_factory=lambda: [224, 224])
     video_backend: str = "torchcodec"
+
+    # DepthMem: precomputed depth maps
+    depthmem_depth_dir: str | None = None
+    depthmem_num_temporal_frames: int = 1

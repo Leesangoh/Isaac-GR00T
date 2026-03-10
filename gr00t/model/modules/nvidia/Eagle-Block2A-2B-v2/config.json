@@ -73,6 +73,8 @@
     "model_type": "siglip2_vision_model",
     "num_attention_heads": 16,
     "num_channels": 3,
+    "num_temporal_frames": 1,
+    "temporal_attention_layers": [],
     "num_hidden_layers": 27,
     "num_patches": 256,
     "patch_size": 14,

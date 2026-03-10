@@ -53,6 +53,10 @@ class VLAStepData:
     )  # Optional embodiment tag for cross-embodiment training
     is_demonstration: bool = False  # Whether the step is a demonstration. If True, no loss should be computed for this step.
 
+    # DepthMem: depth maps and temporal frame info
+    depth_maps: np.ndarray | None = None  # [T, H, W] float32 depth maps in [0, 1]
+    num_temporal_frames: int = 1  # Number of temporal frames (1 = no temporal)
+
     # Flexible metadata that can be extended by users
     metadata: dict[str, Any] = field(default_factory=dict)
 

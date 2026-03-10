@@ -106,11 +106,18 @@ class EagleBackbone(torch.nn.Module):
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values"]
-        vl_input = {k: vl_input[k] for k in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
+        forward_kwargs = {k: vl_input[k] for k in keys_to_use}
+
+        # DepthMem: pass temporal frame count and KV cache if present
+        if "num_temporal_frames" in vl_input:
+            forward_kwargs["num_temporal_frames"] = vl_input["num_temporal_frames"]
+        if "temporal_kv_cache" in vl_input:
+            forward_kwargs["temporal_kv_cache"] = vl_input["temporal_kv_cache"]
+
+        outputs = self.model(**forward_kwargs, output_hidden_states=True)
         outputs = outputs["hidden_states"][-1]
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_index
-        attention_mask = vl_input["attention_mask"] == 1
+        image_mask = forward_kwargs["input_ids"] == self.model.config.image_token_index
+        attention_mask = forward_kwargs["attention_mask"] == 1
         return BatchFeature(
             data={
                 "backbone_features": outputs,
