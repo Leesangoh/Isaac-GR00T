@@ -245,6 +245,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         )
 
         # DepthMem: load precomputed depth maps for T temporal frames
+        if self.depth_dir:
+            print(f"[DEBUG] depth_dir={self.depth_dir}, episode_index={episode_index}, num_temporal_frames={self.num_temporal_frames}", flush=True)
         if self.depth_dir and episode_index is not None and self.num_temporal_frames >= 1:
             chunk_idx = episode_index // self.episode_loader.chunk_size
             T = self.num_temporal_frames
