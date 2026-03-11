@@ -15,11 +15,11 @@ set -eo pipefail
 
 # ── Config (edit these) ──────────────────────────────────────────────────
 DOCKER_IMAGE="dltkdh9845/gr00t-depthmem:latest"
-CODE_DIR="/home/solee/Isaac-GR00T"          # gr00t code (bind-mounted)
-DATA_DIR="/mnt/md1/solee/data/bridge_lerobot"
-DEPTH_DIR="/mnt/md1/solee/bridge_depth_maps"
-MODEL_PATH="/mnt/md1/solee/checkpoints/GR00T-N1.6-bridge"
-OUTPUT_DIR="/mnt/md1/solee/checkpoints/GR00T-N1.6-depthmem"
+CODE_DIR="/home2/leesangoh/Isaac-GR00T"     # gr00t code (bind-mounted, editable)
+DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
+DEPTH_DIR="/home2/leesangoh/datasets/bridge_depth_maps"
+MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-bridge"
+OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depthmem"
 WANDB_API_KEY="${WANDB_API_KEY}"            # set in env or hardcode
 
 # ── Training hyperparams ────────────────────────────────────────────────
