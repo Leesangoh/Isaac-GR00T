@@ -6,14 +6,14 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=200000M
-#SBATCH --time=7-00:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --output=logs_depthmem/%x_%j.out
 #SBATCH --error=logs_depthmem/%x_%j.err
 #SBATCH --export=ALL
 
 set -eo pipefail
 
-# ── Config (edit these) ──────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────
 DOCKER_IMAGE="dltkdh9845/gr00t-depthmem:latest"
 CODE_DIR="/home2/leesangoh/Isaac-GR00T"     # gr00t code (bind-mounted, editable)
 DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
@@ -22,11 +22,12 @@ MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-bridge"
 OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depthmem"
 WANDB_API_KEY="${WANDB_API_KEY}"            # set in env or hardcode
 
-# ── Training hyperparams ────────────────────────────────────────────────
+# ── Training hyperparams (A100 80GB × 4) ────────────────────────────────
 NUM_GPUS=4
-MAX_STEPS=72000          # ~3 epochs (1.52M samples × 3 / 64 effective batch)
-GLOBAL_BATCH_SIZE=16     # micro_batch = 16/4GPUs = 4 per GPU
-GRAD_ACCUM=4             # effective batch = 16 × 4 = 64
+MAX_STEPS=72000          # ~3 epochs (1.52M samples × 3 / 64 eff batch)
+GLOBAL_BATCH_SIZE=32     # micro_batch = 32/4GPUs = 8 per GPU (8×16frames = 128 imgs/fwd)
+GRAD_ACCUM=2             # effective batch = 32 × 2 = 64
+SAVE_STEPS=1000          # checkpoint every 1000 steps (~2h intervals)
 
 # ── GPU / CPU detection ─────────────────────────────────────────────────
 UUIDLIST=$(nvidia-smi -L | cut -d '(' -f 2 | awk '{print$2}' | tr -d ")" | paste -s -d, -)
@@ -40,6 +41,8 @@ nvidia-smi
 mkdir -p logs_depthmem
 
 # ── Run training in Docker ──────────────────────────────────────────────
+# Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
+# Just re-run `sbatch` after a job ends/preempts and it picks up where it left off.
 docker run --rm \
   --gpus ${GPULIST} \
   --cpuset-cpus ${CPULIST} \
@@ -73,7 +76,7 @@ docker run --rm \
       --state_dropout_prob 0.8 \
       --color_jitter_params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
       --dataloader_num_workers 4 \
-      --save_steps 2000 \
+      --save_steps '"${SAVE_STEPS}"' \
       --save_total_limit 5 \
       --use_wandb \
       --gradient_checkpointing \
