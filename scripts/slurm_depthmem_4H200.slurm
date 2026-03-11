@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=depthmem_train
+#SBATCH --job-name=depthmem_4H200
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
@@ -20,14 +20,14 @@ DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
 DEPTH_DIR="/home2/leesangoh/datasets/bridge_depth_maps"
 MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-bridge"
 OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depthmem"
-WANDB_API_KEY="${WANDB_API_KEY}"            # set in env or hardcode
+WANDB_API_KEY="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"            # set in env or hardcode
 
-# ── Training hyperparams (A100 80GB × 4) ────────────────────────────────
+# ── Training hyperparams (H200 141GB × 4) ───────────────────────────────
 NUM_GPUS=4
-MAX_STEPS=72000          # ~3 epochs (1.52M samples × 3 / 64 eff batch)
-GLOBAL_BATCH_SIZE=32     # micro_batch = 32/4GPUs = 8 per GPU (8×16frames = 128 imgs/fwd)
-GRAD_ACCUM=2             # effective batch = 32 × 2 = 64
-SAVE_STEPS=1000          # checkpoint every 1000 steps (~2h intervals)
+MAX_STEPS=42000          # ~1.8 epochs in 72h (eff_batch=64, ~6s/step)
+GLOBAL_BATCH_SIZE=64     # micro_batch = 64/4GPUs = 16 per GPU (16×16frames = 256 imgs/fwd)
+GRAD_ACCUM=1             # effective batch = 64 × 1 = 64
+SAVE_STEPS=1000          # checkpoint every ~1.7h
 
 # ── GPU / CPU detection ─────────────────────────────────────────────────
 UUIDLIST=$(nvidia-smi -L | cut -d '(' -f 2 | awk '{print$2}' | tr -d ")" | paste -s -d, -)
@@ -41,8 +41,6 @@ nvidia-smi
 mkdir -p logs_depthmem
 
 # ── Run training in Docker ──────────────────────────────────────────────
-# Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
-# Just re-run `sbatch` after a job ends/preempts and it picks up where it left off.
 docker run --rm \
   --gpus ${GPULIST} \
   --cpuset-cpus ${CPULIST} \
@@ -77,7 +75,7 @@ docker run --rm \
       --color_jitter_params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
       --dataloader_num_workers 4 \
       --save_steps '"${SAVE_STEPS}"' \
-      --save_total_limit 5 \
+      --save_total_limit 4 \
       --use_wandb \
       --gradient_checkpointing \
       --action_horizon 8 \
