@@ -64,7 +64,7 @@ docker run --rm \
     set -euo pipefail
     cd /workspace/gr00t
 
-    torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29500 \
+    torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29501 \
       gr00t/experiment/launch_finetune.py \
       --base_model_path /checkpoints/GR00T-N1.6-bridge \
       --dataset_path /data/bridge_lerobot \
