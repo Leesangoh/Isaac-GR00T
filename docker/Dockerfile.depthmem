@@ -1,21 +1,26 @@
-FROM nvcr.io/nvidia/pytorch:25.04-py3
+FROM nvcr.io/nvidia/cuda:12.6.3-devel-ubuntu22.04
 
 ENV NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System deps ──────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential yasm cmake libtool git pkg-config \
+    build-essential yasm cmake libtool git pkg-config curl \
     libass-dev libfreetype6-dev libvorbis-dev \
     autoconf automake texinfo tmux ffmpeg libegl1 \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y python3.10 python3.10-venv python3.10-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python tooling ──────────────────────────────────────────────────────
-RUN pip install --upgrade pip setuptools wheel && pip install uv
+# ── Set Python 3.10 as default ──────────────────────────────────────────
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
 
-# Fix NVIDIA container pip constraints that conflict with our deps
-RUN sed -i s/dill==0.3.9/dill==0.3.8/g /etc/pip/constraint.txt 2>/dev/null || true && \
-    sed -i s/scipy==1.15.2/scipy==1.15.3/g /etc/pip/constraint.txt 2>/dev/null || true
+# ── Python tooling ──────────────────────────────────────────────────────
+RUN pip install --upgrade pip setuptools wheel
 
 # ── Install gr00t dependencies (frozen versions) ────────────────────────
 # Core ML stack
