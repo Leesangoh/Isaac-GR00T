@@ -3,6 +3,9 @@ FROM nvcr.io/nvidia/cuda:12.6.3-devel-ubuntu22.04
 ENV NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute
 ENV DEBIAN_FRONTEND=noninteractive
 
+# ── Fix /tmp permissions (some CUDA base images restrict it) ─────────────
+RUN chmod 1777 /tmp
+
 # ── System deps ──────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential yasm cmake libtool git pkg-config curl \
