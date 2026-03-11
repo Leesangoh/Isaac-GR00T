@@ -52,6 +52,8 @@ docker run --rm \
   --network host \
   --name ${USER}_depth_T1_${SLURM_JOB_ID} \
   -e WANDB_API_KEY \
+  -e NCCL_TIMEOUT=3600 \
+  -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \
   -v ${CODE_DIR}:/workspace/gr00t \
   -v ${DATA_DIR}:/data/bridge_lerobot \
   -v ${DEPTH_DIR}:/data/bridge_depth_maps \
