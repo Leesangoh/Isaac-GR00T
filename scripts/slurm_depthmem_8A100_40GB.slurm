@@ -20,7 +20,7 @@ DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
 DEPTH_DIR="/home2/leesangoh/datasets/bridge_depth_maps"
 MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-bridge"
 OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depthmem"
-WANDB_API_KEY="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"            # set in env or hardcode
+export WANDB_API_KEY="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"
 
 # ── Training hyperparams (A100 40GB × 8) ────────────────────────────────
 NUM_GPUS=8

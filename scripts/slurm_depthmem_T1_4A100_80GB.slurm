@@ -1,11 +1,11 @@
 #!/bin/bash
 
-#SBATCH --job-name=depthmem_8H200
+#SBATCH --job-name=depth_T1_train
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=400000M
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=200000M
 #SBATCH --time=3-00:00:00
 #SBATCH --output=logs_depthmem/%x_%j.out
 #SBATCH --error=logs_depthmem/%x_%j.err
@@ -19,15 +19,16 @@ CODE_DIR="/home2/leesangoh/Isaac-GR00T"     # gr00t code (bind-mounted, editable
 DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
 DEPTH_DIR="/home2/leesangoh/datasets/bridge_depth_maps"
 MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-bridge"
-OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depthmem"
+OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depth-T1"
 export WANDB_API_KEY="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"
 
-# ── Training hyperparams (H200 141GB × 8) ───────────────────────────────
-NUM_GPUS=8
-MAX_STEPS=72000          # ~6 epochs in 72h (eff_batch=128, ~3s/step)
-GLOBAL_BATCH_SIZE=128    # micro_batch = 128/8GPUs = 16 per GPU (16×16frames = 256 imgs/fwd)
-GRAD_ACCUM=1             # effective batch = 128 × 1 = 128
-SAVE_STEPS=2000          # checkpoint every ~1.7h
+# ── Training hyperparams (A100 80GB × 4, T=1 per-frame RGBD) ────────────
+# T=1 uses ~16× less memory per sample than T=16, so we can use larger batch
+NUM_GPUS=4
+MAX_STEPS=72000          # ~3 epochs (1.52M samples × 3 / 64 eff batch)
+GLOBAL_BATCH_SIZE=64     # micro_batch = 64/4GPUs = 16 per GPU (T=1, only 1 frame)
+GRAD_ACCUM=1             # effective batch = 64 × 1 = 64
+SAVE_STEPS=1000          # checkpoint every ~1h
 
 # ── GPU / CPU detection ─────────────────────────────────────────────────
 UUIDLIST=$(nvidia-smi -L | cut -d '(' -f 2 | awk '{print$2}' | tr -d ")" | paste -s -d, -)
@@ -43,18 +44,19 @@ mkdir -p logs_depthmem
 docker pull ${DOCKER_IMAGE}
 
 # ── Run training in Docker ──────────────────────────────────────────────
+# Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
 docker run --rm \
   --gpus ${GPULIST} \
   --cpuset-cpus ${CPULIST} \
   --ipc=host \
   --network host \
-  --name ${USER}_depthmem_${SLURM_JOB_ID} \
+  --name ${USER}_depth_T1_${SLURM_JOB_ID} \
   -e WANDB_API_KEY \
   -v ${CODE_DIR}:/workspace/gr00t \
   -v ${DATA_DIR}:/data/bridge_lerobot \
   -v ${DEPTH_DIR}:/data/bridge_depth_maps \
   -v ${MODEL_PATH}:/checkpoints/GR00T-N1.6-bridge \
-  -v ${OUTPUT_DIR}:/checkpoints/GR00T-N1.6-depthmem \
+  -v ${OUTPUT_DIR}:/checkpoints/GR00T-N1.6-depth-T1 \
   ${DOCKER_IMAGE} \
   bash -lc '
     set -euo pipefail
@@ -66,7 +68,7 @@ docker run --rm \
       --dataset_path /data/bridge_lerobot \
       --embodiment_tag OXE_WIDOWX \
       --num_gpus '"${NUM_GPUS}"' \
-      --output_dir /checkpoints/GR00T-N1.6-depthmem \
+      --output_dir /checkpoints/GR00T-N1.6-depth-T1 \
       --max_steps '"${MAX_STEPS}"' \
       --global_batch_size '"${GLOBAL_BATCH_SIZE}"' \
       --gradient_accumulation_steps '"${GRAD_ACCUM}"' \
@@ -82,7 +84,7 @@ docker run --rm \
       --gradient_checkpointing \
       --action_horizon 8 \
       --depthmem_enabled \
-      --depthmem_num_temporal_frames 16 \
+      --depthmem_num_temporal_frames 1 \
       --depthmem_depth_dir /data/bridge_depth_maps \
       --depthmem_lora_rank 16 \
       --video_backend ffmpeg \
