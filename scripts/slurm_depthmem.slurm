@@ -14,7 +14,7 @@
 set -eo pipefail
 
 # ── Config (edit these) ──────────────────────────────────────────────────
-DOCKER_IMAGE="solee/gr00t-depthmem:latest"
+DOCKER_IMAGE="dltkdh9845/gr00t-depthmem:latest"
 CODE_DIR="/home/solee/Isaac-GR00T"          # gr00t code (bind-mounted)
 DATA_DIR="/mnt/md1/solee/data/bridge_lerobot"
 DEPTH_DIR="/mnt/md1/solee/bridge_depth_maps"
