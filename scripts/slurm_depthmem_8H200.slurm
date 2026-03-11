@@ -40,6 +40,8 @@ nvidia-smi
 
 mkdir -p logs_depthmem
 
+docker pull ${DOCKER_IMAGE}
+
 # ── Run training in Docker ──────────────────────────────────────────────
 docker run --rm \
   --gpus ${GPULIST} \

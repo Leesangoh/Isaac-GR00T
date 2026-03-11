@@ -40,6 +40,8 @@ nvidia-smi
 
 mkdir -p logs_depthmem
 
+docker pull ${DOCKER_IMAGE}
+
 # ── Run training in Docker ──────────────────────────────────────────────
 # Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
 # Just re-run `sbatch` after a job ends/preempts and it picks up where it left off.
