@@ -190,7 +190,7 @@ class Eagle3_VLForConditionalGeneration(Eagle3_VLPreTrainedModel, GenerationMixi
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        input_embeds = self.language_model.get_input_embeddings()(input_ids)
+        input_embeds = self.language_model.get_input_embeddings()(input_ids).clone()
 
         num_images = len(pixel_values)
 

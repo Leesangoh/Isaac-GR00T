@@ -31,9 +31,10 @@ export NUM_GPUS=4
 # === DepthMem settings ===
 NUM_TEMPORAL_FRAMES=16
 
-# === Training hyperparameters (matched to bridge finetune) ===
+# === Training hyperparameters ===
 MAX_STEPS=20000
-GLOBAL_BATCH_SIZE=256       # 256 for 4 GPUs (bridge uses 1024 with 8 GPUs)
+GLOBAL_BATCH_SIZE=16        # micro_batch = 16/4GPUs = 4 per GPU (4×16frames = 64 images/fwd)
+GRAD_ACCUM=4                # effective batch = 16 × 4 = 64 per step
 LR=1e-4
 WARMUP_RATIO=0.05
 WEIGHT_DECAY=1e-5
@@ -67,6 +68,7 @@ $TORCHRUN --nproc_per_node=$NUM_GPUS --master_port=29500 \
     --output_dir "${OUTPUT_DIR}" \
     --max_steps $MAX_STEPS \
     --global_batch_size $GLOBAL_BATCH_SIZE \
+    --gradient_accumulation_steps $GRAD_ACCUM \
     --learning_rate $LR \
     --warmup_ratio $WARMUP_RATIO \
     --weight_decay $WEIGHT_DECAY \
@@ -82,6 +84,7 @@ $TORCHRUN --nproc_per_node=$NUM_GPUS --master_port=29500 \
     --depthmem_num_temporal_frames $NUM_TEMPORAL_FRAMES \
     --depthmem_depth_dir "${DEPTH_DIR}" \
     --depthmem_lora_rank 16 \
-    --video_backend ffmpeg
+    --video_backend ffmpeg \
+    --shard_size 128
 
 echo "Fine-tuning complete. Checkpoint saved to ${OUTPUT_DIR}"

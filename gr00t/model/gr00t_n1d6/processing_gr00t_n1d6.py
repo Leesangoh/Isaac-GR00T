@@ -83,6 +83,8 @@ class Gr00tN1d6DataCollator:
                 # Handle vlm_content specially - extract text and images
                 text_list = []
                 image_inputs = []
+                temporal_image_inputs = []
+                has_temporal = False
                 for v in values:
                     curr_text_list = [v["text"]]
 
@@ -90,14 +92,44 @@ class Gr00tN1d6DataCollator:
                     curr_image_inputs = v["images"]
                     image_inputs += curr_image_inputs
 
+                    # DepthMem: collect temporal images (all T*V frames)
+                    if "temporal_images" in v:
+                        temporal_image_inputs.extend(v.pop("temporal_images"))
+                        has_temporal = True
+
                 # NOTE: some VLMs need this, others don't.
                 if self.model_type == "eagle":
                     image_inputs, _ = self.processor.process_vision_info(
                         [v["conversation"] for v in values]
                     )
+
                 vlm_inputs = self.processor(
                     text=text_list, images=image_inputs, return_tensors="pt", padding=True
                 )
+
+                # DepthMem: replace pixel_values with all temporal images for vision
+                # encoder temporal attention. input_ids keeps V×81 tokens (current frame
+                # only), but pixel_values needs T*V images so temporal attention can
+                # attend to past frames and output current frame embeddings.
+                if has_temporal:
+                    temporal_conversation = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": img}
+                                for img in temporal_image_inputs
+                            ],
+                        }
+                    ]
+                    temporal_resized, _ = self.processor.process_vision_info(
+                        [temporal_conversation]
+                    )
+                    temporal_pv = self.processor.image_processor(
+                        images=temporal_resized, return_tensors="pt"
+                    )
+                    # Replace pixel_values: wrap in list to match expected format
+                    # (list of [B_i, C, H, W] tensors grouped by resolution)
+                    vlm_inputs["pixel_values"] = [temporal_pv["pixel_values"]]
                 for k, v in vlm_inputs.items():
                     batch[k] = v
             elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
@@ -452,7 +484,23 @@ class Gr00tN1d6Processor(BaseProcessor):
             .numpy()
         )  # (T*V, C, H, W), Eagle processor expects numpy array
 
-        vlm_inputs = self._apply_vlm_processing(stacked_images, language)
+        num_views = len(image_keys)
+        T = stacked_images.shape[0] // num_views
+
+        if depth_maps is not None and T > 1:
+            # DepthMem temporal mode: only pass current frame (last V images) to VLM
+            # processing so input_ids has V×81 image tokens (not T*V×81).
+            # The full T*V images go as pixel_values for the vision encoder's
+            # temporal attention, which reduces T frames → 1 current frame.
+            current_images = stacked_images[-num_views:]  # [V, C, H, W]
+            vlm_inputs = self._apply_vlm_processing(current_images, language)
+            # Store all temporal images as PIL for collator to use as pixel_values
+            all_temporal_pil = [
+                Image.fromarray(np.transpose(v, (1, 2, 0))) for v in stacked_images
+            ]
+            vlm_inputs["vlm_content"]["temporal_images"] = all_temporal_pil
+        else:
+            vlm_inputs = self._apply_vlm_processing(stacked_images, language)
 
         # DepthMem: apply same spatial transforms to depth maps, then attach
         if depth_maps is not None:

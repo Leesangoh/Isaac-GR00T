@@ -527,6 +527,8 @@ class Gr00tN1d6(PreTrainedModel):
 
         # Move to device and dtype
         def to_device_with_dtype(x):
+            if not isinstance(x, torch.Tensor):
+                return x
             if torch.is_floating_point(x):
                 return x.to(self.device, dtype=self.dtype)
             else:
