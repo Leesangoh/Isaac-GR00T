@@ -24,7 +24,7 @@ export WANDB_API_KEY="wandb_v1_TtutYHjnUFsuKnxxfV99W9rYIVr_egSjaiHOLWG5uQeZXsbMp
 
 # ── Training hyperparams (A100 80GB × 4) ────────────────────────────────
 NUM_GPUS=4
-MAX_STEPS=72000          # ~3 epochs (1.52M samples × 3 / 64 eff batch)
+MAX_STEPS=108000         # ~4.5 epochs, continues from 8A100_40GB checkpoint at 36K
 GLOBAL_BATCH_SIZE=32     # micro_batch = 32/4GPUs = 8 per GPU (8×16frames = 128 imgs/fwd)
 GRAD_ACCUM=2             # effective batch = 32 × 2 = 64
 SAVE_STEPS=1000          # checkpoint every 1000 steps (~2h intervals)
