@@ -41,17 +41,24 @@ nvidia-smi
 
 mkdir -p logs_depthmem_pt
 
+# ── Container naming & cleanup ──────────────────────────────────────────
+CONTAINER_NAME="${SLURM_JOB_USER}_job_${SLURM_JOB_ID}_depthmem_pt"
+cleanup() {
+  docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+}
+trap cleanup EXIT SIGTERM SIGINT
+
 docker pull ${DOCKER_IMAGE}
 
 # ── Run training in Docker ──────────────────────────────────────────────
 # Model is auto-downloaded from HuggingFace on first run and cached in HF_CACHE.
 # Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
-docker run --rm \
+docker run \
   --gpus ${GPULIST} \
   --cpuset-cpus ${CPULIST} \
   --ipc=host \
   --network host \
-  --name ${USER}_depthmem_pt_${SLURM_JOB_ID} \
+  --name ${CONTAINER_NAME} \
   -e WANDB_API_KEY \
   -e NCCL_TIMEOUT=3600 \
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \

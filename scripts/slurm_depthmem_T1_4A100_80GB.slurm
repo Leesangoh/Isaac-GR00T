@@ -41,19 +41,23 @@ nvidia-smi
 
 mkdir -p logs_depthmem
 
+# ── Container naming & cleanup ──────────────────────────────────────────
+CONTAINER_NAME="${SLURM_JOB_USER}_job_${SLURM_JOB_ID}_depth_T1"
+cleanup() {
+  docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+}
+trap cleanup EXIT SIGTERM SIGINT
+
 docker pull ${DOCKER_IMAGE}
 
 # ── Run training in Docker ──────────────────────────────────────────────
-# Kill any existing container with the same name
-docker rm -f ${USER}_depth_T1_${SLURM_JOB_ID} 2>/dev/null || true
-
 # Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
-docker run --rm \
+docker run \
   --gpus ${GPULIST} \
   --cpuset-cpus ${CPULIST} \
   --ipc=host \
   --network host \
-  --name ${USER}_depth_T1_${SLURM_JOB_ID} \
+  --name ${CONTAINER_NAME} \
   -e WANDB_API_KEY \
   -e NCCL_TIMEOUT=3600 \
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \

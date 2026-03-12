@@ -40,17 +40,24 @@ nvidia-smi
 
 mkdir -p logs_depthmem
 
+# ── Container naming & cleanup ──────────────────────────────────────────
+CONTAINER_NAME="${SLURM_JOB_USER}_job_${SLURM_JOB_ID}_depthmem"
+cleanup() {
+  docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+}
+trap cleanup EXIT SIGTERM SIGINT
+
 docker pull ${DOCKER_IMAGE}
 
 # ── Run training in Docker ──────────────────────────────────────────────
 # Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
 # Just re-run `sbatch` after a job ends/preempts and it picks up where it left off.
-docker run --rm \
+docker run \
   --gpus ${GPULIST} \
   --cpuset-cpus ${CPULIST} \
   --ipc=host \
   --network host \
-  --name ${USER}_depthmem_${SLURM_JOB_ID} \
+  --name ${CONTAINER_NAME} \
   -e WANDB_API_KEY \
   -e NCCL_TIMEOUT=3600 \
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \
