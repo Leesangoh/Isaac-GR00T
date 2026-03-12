@@ -416,6 +416,7 @@ def run_gr00t_sim_policy(
     policy_client_port: int | None = None,
     n_envs: int = 8,
     n_action_steps: int = 8,
+    video_history_len: int = 1,
 ):
     embodiment_tag = get_embodiment_tag_from_env_name(env_name)
 
@@ -434,6 +435,7 @@ def run_gr00t_sim_policy(
             max_episode_steps=max_episode_steps,
         ),
         multistep=MultiStepConfig(
+            video_delta_indices=np.array(list(range(-(video_history_len - 1), 1))),
             n_action_steps=n_action_steps,
             max_episode_steps=max_episode_steps,
             terminate_on_success=True,
@@ -473,6 +475,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n_envs", type=int, default=8)
     parser.add_argument("--n_action_steps", type=int, default=8)
+    parser.add_argument(
+        "--video_history_len",
+        type=int,
+        default=1,
+        help="Number of consecutive video frames to send (e.g., 16 for DepthMem temporal context)",
+    )
 
     args = parser.parse_args()
 
@@ -495,6 +503,7 @@ if __name__ == "__main__":
         policy_client_port=args.policy_client_port,
         n_envs=args.n_envs,
         n_action_steps=args.n_action_steps,
+        video_history_len=args.video_history_len,
     )
     print("results: ", results)
     print("success rate: ", np.mean(results[1]))

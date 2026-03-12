@@ -8,10 +8,14 @@ from transforms3d import euler as te, quaternions as tq
 
 
 class GoogleFractalEnv(gym.Env):
+    _instance_counter = 0
+
     def __init__(self, env_name: str, image_size: tuple[int, int]):
         env = simpler_env.make(env_name)
         env._max_episode_steps = 10000
         self.env = env
+        self._env_idx = GoogleFractalEnv._instance_counter
+        GoogleFractalEnv._instance_counter += 1
         agent_space = env.observation_space["agent"]
         print("[SimplerEnv] agent space keys:", list(agent_space.spaces.keys()))
         # assert False
@@ -60,7 +64,9 @@ class GoogleFractalEnv(gym.Env):
         self.sticky_action_is_on = False
         self.sticky_gripper_action = 0.0
         self.gripper_action_repeat = 0
-        observation, info = self.env.reset()
+        if seed is None:
+            seed = np.random.randint(0, 2**31) + self._env_idx
+        observation, info = self.env.reset(seed=seed)
         observation = self._process_observation(observation)
         info["success"] = False
         return observation, info
@@ -118,10 +124,15 @@ class GoogleFractalEnv(gym.Env):
 
 
 class WidowXBridgeEnv(gym.Env):
+    _instance_counter = 0
+
     def __init__(self, env_name: str, image_size: tuple[int, int]):
         env = simpler_env.make(env_name)
         env._max_episode_steps = 10000
         self.env = env
+        # Unique per-instance seed offset so parallel envs diverge
+        self._env_idx = WidowXBridgeEnv._instance_counter
+        WidowXBridgeEnv._instance_counter += 1
         obs_low = env.observation_space["agent"]["eef_pos"].low
         obs_high = env.observation_space["agent"]["eef_pos"].high
         self.observation_space = gym.spaces.Dict(
@@ -160,7 +171,12 @@ class WidowXBridgeEnv(gym.Env):
         self.default_rot = np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])
 
     def reset(self, seed=None, options=None):
-        observation, info = self.env.reset()
+        # Ensure each parallel env gets a different seed for object randomization.
+        # ManiSkill2 uses a fixed main_rng (seed=2022), so without explicit seeds
+        # all spawn-ed envs produce identical object placements.
+        if seed is None:
+            seed = np.random.randint(0, 2**31) + self._env_idx
+        observation, info = self.env.reset(seed=seed)
         observation = self._process_observation(observation)
         info["success"] = False
         return observation, info

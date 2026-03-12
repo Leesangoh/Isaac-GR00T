@@ -4,10 +4,9 @@ Extends Gr00tPolicy to:
 1. Maintain an RGB frame buffer for Video Depth Anything
 2. Generate temporally consistent depth maps at each step
 3. Pass RGBD (4ch) frames through SigLIP2 with temporal attention
-4. Manage temporal KV cache for efficient inference
 """
 
-from collections import deque
+import copy
 import logging
 import os
 import sys
@@ -32,8 +31,7 @@ class DepthMemPolicy(Gr00tPolicy):
     - Maintains an RGB frame buffer (deque of T frames)
     - Runs Video Depth Anything Small on the buffer each step
     - Concatenates depth as 4th channel
-    - Passes num_temporal_frames through the VLM pipeline
-    - Manages temporal KV cache for SigLIP2 temporal attention layers
+    - Passes T temporal frames through the VLM pipeline with temporal attention
     """
 
     def __init__(
@@ -46,10 +44,11 @@ class DepthMemPolicy(Gr00tPolicy):
         num_temporal_frames: int = 6,
         depth_model_size: str = "small",
         depth_resolution: int = 224,
-        use_temporal_kv_cache: bool = True,
-        compile_depth_model: bool = True,
+        compile_depth_model: bool = False,
         save_attention_map: bool = False,
         attention_map_dir: str = "./attention_maps",
+        save_video_dir: str | None = None,
+        video_fps: int = 10,
     ):
         """Initialize DepthMem policy.
 
@@ -60,8 +59,9 @@ class DepthMemPolicy(Gr00tPolicy):
             num_temporal_frames: T - number of frames to maintain in buffer.
             depth_model_size: Video Depth Anything model size ('small', 'base', 'large').
             depth_resolution: Input resolution for depth model.
-            use_temporal_kv_cache: Whether to cache temporal attention KVs.
             compile_depth_model: Whether to torch.compile the depth model.
+            save_video_dir: If set, save RGB|Depth side-by-side videos per episode.
+            video_fps: FPS for saved videos.
         """
         super().__init__(
             embodiment_tag=embodiment_tag,
@@ -74,13 +74,24 @@ class DepthMemPolicy(Gr00tPolicy):
 
         self.num_temporal_frames = num_temporal_frames
         self.depth_resolution = depth_resolution
-        self.use_temporal_kv_cache = use_temporal_kv_cache
 
-        # RGB frame buffer: stores recent frames for depth estimation
-        self.rgb_buffer = deque(maxlen=num_temporal_frames)
+        # Deep copy modality_configs so we don't modify the processor's internal state.
+        # Override video delta_indices to match the T frames sent by the client.
+        self.modality_configs = copy.deepcopy(self.modality_configs)
+        self.modality_configs["video"].delta_indices = list(range(-(num_temporal_frames - 1), 1))
 
-        # Temporal KV cache for SigLIP2 temporal attention
-        self.temporal_kv_cache = {} if use_temporal_kv_cache else None
+        # Load checkpoint with LoRA merging and patch embedding fix.
+        # AutoModel.from_pretrained doesn't handle PEFT keys, so we load manually.
+        self._load_depthmem_checkpoint(model_path)
+
+        # Per-env episode video recording (RGB | Depth side-by-side)
+        self.save_video_dir = save_video_dir
+        self.video_fps = video_fps
+        self._episode_frames: dict[int, list[np.ndarray]] = {}
+        self._episode_counter = 0
+        if save_video_dir:
+            os.makedirs(save_video_dir, exist_ok=True)
+            print(f"[DepthMem] Episode videos will be saved to {save_video_dir}")
 
         # Load Video Depth Anything
         self.depth_model = self._load_depth_model(depth_model_size, device, compile_depth_model)
@@ -88,6 +99,140 @@ class DepthMemPolicy(Gr00tPolicy):
         logger.info(
             f"DepthMem policy initialized: T={num_temporal_frames}, "
             f"depth_model={depth_model_size}, resolution={depth_resolution}"
+        )
+
+    def _load_depthmem_checkpoint(self, model_path: str):
+        """Load DepthMem checkpoint with LoRA merging and patch embedding fix.
+
+        The checkpoint was saved with PEFT/LoRA wrappers, so keys have prefixes like
+        'base_model.model.' and LoRA weights as 'lora_A.default.weight' / 'lora_B.default.weight'.
+        AutoModel.from_pretrained doesn't handle these, so we:
+        1. Load all checkpoint tensors
+        2. Map PEFT-prefixed keys to model keys
+        3. Merge LoRA adapters: W_merged = W_base + (lora_B @ lora_A) * scale
+        4. Handle the 3ch→4ch patch embedding expansion
+        5. Load the merged state dict into the model
+        """
+        from pathlib import Path
+        import re
+
+        from safetensors import safe_open
+
+        ckpt_dir = Path(model_path)
+
+        # Step 1: Load all checkpoint tensors
+        ckpt_state = {}
+        for sf_file in sorted(ckpt_dir.glob("model*.safetensors")):
+            with safe_open(str(sf_file), framework="pt") as f:
+                for key in f.keys():
+                    ckpt_state[key] = f.get_tensor(key)
+        print(f"[DepthMem] Loaded {len(ckpt_state)} tensors from checkpoint")
+
+        # Step 2: Separate into base_layer, lora, and normal keys
+        base_layer_map = {}  # model_key -> tensor
+        lora_a_map = {}  # model_key -> tensor
+        lora_b_map = {}  # model_key -> tensor
+        normal_map = {}  # model_key -> tensor
+
+        def strip_peft_prefix(key):
+            """Remove PEFT wrapper prefixes to get the model key."""
+            key = re.sub(r"\.base_model\.model\.", ".", key)
+            key = re.sub(r"^base_model\.model\.", "", key)
+            return key
+
+        for ck, tensor in ckpt_state.items():
+            if ".base_layer." in ck:
+                # e.g. backbone.model.xxx.base_model.model.xxx.self_attn.q_proj.base_layer.weight
+                model_key = strip_peft_prefix(ck).replace(".base_layer.", ".")
+                base_layer_map[model_key] = tensor
+            elif ".lora_A.default." in ck:
+                model_key = strip_peft_prefix(ck).replace(".lora_A.default.", ".")
+                lora_a_map[model_key] = tensor
+            elif ".lora_B.default." in ck:
+                model_key = strip_peft_prefix(ck).replace(".lora_B.default.", ".")
+                lora_b_map[model_key] = tensor
+            else:
+                model_key = strip_peft_prefix(ck)
+                normal_map[model_key] = tensor
+
+        print(
+            f"[DepthMem] Keys: {len(normal_map)} normal, "
+            f"{len(base_layer_map)} base_layer, "
+            f"{len(lora_a_map)} lora_A, {len(lora_b_map)} lora_B"
+        )
+
+        # Step 3: Merge LoRA into base weights
+        # LoRA formula: W_merged = W_base + (B @ A) * scaling
+        # Default LoRA scaling = alpha / rank (typically alpha=rank, so scaling=1.0)
+        lora_scaling = 1.0  # alpha=rank by default in PEFT
+        merged = {}
+
+        # Start with base_layer weights
+        for key, tensor in base_layer_map.items():
+            merged[key] = tensor.clone()
+
+        # Add LoRA contribution
+        lora_merged_count = 0
+        for key in lora_a_map:
+            if key in lora_b_map and key in merged:
+                A = lora_a_map[key]  # [rank, in_features]
+                B = lora_b_map[key]  # [out_features, rank]
+                merged[key] = merged[key] + (B @ A) * lora_scaling
+                lora_merged_count += 1
+
+        print(f"[DepthMem] Merged {lora_merged_count} LoRA adapters into base weights")
+
+        # Add normal (non-PEFT) weights
+        merged.update(normal_map)
+
+        # Step 4: Handle patch embedding 3ch→4ch
+        model_params = dict(self.model.named_parameters())
+        patch_embed_key = None
+        for name in model_params:
+            if "patch_embedding.weight" in name:
+                patch_embed_key = name
+                break
+
+        if patch_embed_key and patch_embed_key in merged:
+            ckpt_shape = merged[patch_embed_key].shape
+            model_shape = model_params[patch_embed_key].shape
+            if ckpt_shape != model_shape and ckpt_shape[1] == 784:
+                # Need to expand model's patch_embedding from 3ch to 4ch
+                # patch_embed_key is like "...embeddings.patch_embedding.weight"
+                # Navigate to "patch_embedding" module (2 levels up from ".weight")
+                module_parts = patch_embed_key.rsplit(".", 1)[0].split(".")
+                parent = self.model
+                for part in module_parts[:-1]:
+                    parent = getattr(parent, part)
+                old_module = getattr(parent, module_parts[-1])
+                device = old_module.weight.device
+                dtype = old_module.weight.dtype
+                new_embed = torch.nn.Linear(784, ckpt_shape[0], bias=old_module.bias is not None)
+                new_embed = new_embed.to(device=device, dtype=dtype)
+                setattr(parent, module_parts[-1], new_embed)
+                print(f"[DepthMem] Expanded patch_embedding: {model_shape} -> {ckpt_shape}")
+
+        # Step 5: Load merged weights into model
+        model_state = self.model.state_dict()
+        loaded, skipped, shape_mismatch = 0, 0, 0
+        for key, tensor in merged.items():
+            if key in model_state:
+                if model_state[key].shape == tensor.shape:
+                    model_state[key] = tensor
+                    loaded += 1
+                else:
+                    print(
+                        f"[DepthMem] Shape mismatch: {key} "
+                        f"model={model_state[key].shape} ckpt={tensor.shape}"
+                    )
+                    shape_mismatch += 1
+            else:
+                skipped += 1
+
+        self.model.load_state_dict(model_state, strict=False)
+        self.model.to(device=self.model.device, dtype=torch.bfloat16)
+        print(
+            f"[DepthMem] Loaded {loaded} params, skipped {skipped}, shape_mismatch {shape_mismatch}"
         )
 
     def _load_depth_model(self, model_size: str, device, compile_model: bool):
@@ -151,41 +296,129 @@ class DepthMemPolicy(Gr00tPolicy):
 
         return depths.astype(np.float32)
 
-    def reset(self):
-        """Reset buffers for a new episode."""
-        self.rgb_buffer.clear()
-        if self.temporal_kv_cache is not None:
-            self.temporal_kv_cache.clear()
+    @staticmethod
+    def _colorize_depth(depth: np.ndarray) -> np.ndarray:
+        """Convert a [H, W] float32 depth map in [0,1] to an [H, W, 3] uint8 inferno colormap."""
+        import matplotlib.cm as cm
+
+        colored = cm.inferno(depth)[:, :, :3]  # [H, W, 3] float in [0,1]
+        return (colored * 255).astype(np.uint8)
+
+    def _save_episode_video(self, frames: list[np.ndarray] | None = None):
+        """Save RGB|Depth frames as a side-by-side mp4 (h264)."""
+        if frames is None:
+            return
+        if not frames:
+            return
+
+        import subprocess
+
+        path = os.path.join(self.save_video_dir, f"episode_{self._episode_counter:04d}.mp4")
+        H, W, _ = frames[0].shape
+
+        # Pipe raw frames to ffmpeg for h264 encoding
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{W}x{H}",
+            "-r",
+            str(self.video_fps),
+            "-i",
+            "pipe:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "23",
+            "-preset",
+            "fast",
+            path,
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        for frame in frames:
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        proc.wait()
+        print(f"[DepthMem] Saved episode video ({len(frames)} frames): {path}")
+
+    def _flush_video(self, env_idx: int | None = None):
+        """Save any accumulated episode frames.
+
+        Args:
+            env_idx: If given, flush only that env. Otherwise flush all envs.
+        """
+        if not self.save_video_dir:
+            return
+        indices = [env_idx] if env_idx is not None else list(self._episode_frames.keys())
+        for idx in indices:
+            frames = self._episode_frames.get(idx, [])
+            if frames:
+                self._save_episode_video(frames)
+                self._episode_counter += 1
+                self._episode_frames[idx] = []
+
+    def _flush_all_videos(self):
+        """Save all remaining episode videos (called on shutdown)."""
+        self._flush_video()
+
+    def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Reset for a new episode."""
+        result = super().reset(options)
+        self._flush_all_videos()
+        return result
+
+    def __del__(self):
+        """Save any remaining episode video on cleanup."""
+        self._flush_all_videos()
 
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Compute actions with temporal KV cache support.
+        """Compute actions with temporal depth and attention.
 
-        When KV cache is enabled and warm (non-empty), only the current frame
-        is encoded through SigLIP2 — past frames' KVs are retrieved from cache.
-        This avoids re-encoding T frames every step (O(T) → O(1) per step).
-
-        When cache is disabled or cold (first step), falls back to full
-        T-frame encoding via the parent class.
+        The client (MultiStepWrapper) sends T consecutive video frames via
+        video_delta_indices=[-T+1, ..., 0]. This method generates depth maps
+        per env and passes T RGBD frames through the model.
         """
-        if not self.use_temporal_kv_cache or not self.temporal_kv_cache:
-            # First step or cache disabled: encode all T frames (parent behavior)
-            result = super()._get_action(observation, options)
-            # After first full encoding, populate cache if enabled
-            # The cache gets populated inside the model's temporal_attention layers
-            # via the temporal_kv_cache dict reference — but only if we inject it.
-            # For the first step, we do a full re-run with cache injection below.
-            if self.use_temporal_kv_cache and not self.temporal_kv_cache:
-                # Re-run with cache dict injected to warm it up
-                self._warm_up_cache(observation)
-            return result
+        T = self.num_temporal_frames
+        video_keys = self.modality_configs["video"].modality_keys
+        primary_key = video_keys[0]
+        batched_video = observation["video"][primary_key]  # [B, T, H, W, C]
+        B = batched_video.shape[0]
 
-        # KV cache is warm: encode only current frame (T=1)
-        # Extract observation data for attention map visualization
+        # Step 1: Generate depth maps per env from the T frames sent by client
+        per_env_depth = []
+        for b in range(B):
+            temporal_frames = batched_video[b]  # [T, H, W, C]
+            depth_maps = self._generate_depth_maps(temporal_frames)  # [T, H, W]
+            per_env_depth.append(depth_maps)
+
+            # Record RGB | Depth side-by-side frame for episode video
+            if self.save_video_dir:
+                if b not in self._episode_frames:
+                    self._episode_frames[b] = []
+                current_frame = temporal_frames[-1]  # current frame
+                depth_colored = self._colorize_depth(depth_maps[-1])
+                if depth_colored.shape[:2] != current_frame.shape[:2]:
+                    import cv2
+
+                    depth_colored = cv2.resize(
+                        depth_colored, (current_frame.shape[1], current_frame.shape[0])
+                    )
+                side_by_side = np.concatenate([current_frame, depth_colored], axis=1)
+                self._episode_frames[b].append(side_by_side)
+
+        # Step 2: Unbatch, create VLAStepData with per-env depth, process
         if self.save_attention_map:
             self._current_obs_images = [
-                observation["video"][k][0, -1] for k in self.modality_configs["video"].modality_keys
+                observation["video"][k][0, -1]
+                for k in self.modality_configs["video"].modality_keys
             ]
             self._current_instruction = observation["language"][self.language_key][0][0]
 
@@ -193,20 +426,25 @@ class DepthMemPolicy(Gr00tPolicy):
         processed_inputs = []
         states = []
 
-        for obs in unbatched_observations:
-            # Create VLAStepData with only the current frame + its depth
-            vla_step_data = self._to_vla_step_data_current_only(obs)
-            states.append(vla_step_data.states)
-            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+        for b, obs in enumerate(unbatched_observations):
+            step_data = VLAStepData(
+                images=obs["video"],
+                states=obs["state"],
+                actions={},
+                text=obs["language"][self.language_key][0],
+                embodiment=self.embodiment_tag,
+            )
+            step_data.depth_maps = per_env_depth[b]  # per-env depth [T, H, W]
+            step_data.num_temporal_frames = T
+
+            states.append(step_data.states)
+            messages = [{"type": MessageType.EPISODE_STEP.value, "content": step_data}]
             processed_inputs.append(self.processor(messages))
 
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
-        # Inject temporal KV cache and set T=1 (current frame only)
-        collated_inputs["temporal_kv_cache"] = self.temporal_kv_cache
-        collated_inputs["num_temporal_frames"] = 1
-
+        # Step 3: Run model inference
         with self._attention_capture_ctx() as attn_ctx:
             with torch.inference_mode():
                 model_pred = self.model.get_action(**collated_inputs)
@@ -215,10 +453,7 @@ class DepthMemPolicy(Gr00tPolicy):
         if attn_ctx is not None:
             self._flush_attention_data(attn_ctx)
 
-        # Trim cache to keep only last (T-1) frames' KVs
-        self._trim_kv_cache()
-
-        # Decode actions
+        # Step 4: Decode actions
         batched_states = {}
         for k in self.modality_configs["state"].modality_keys:
             batched_states[k] = np.stack([s[k] for s in states], axis=0)
@@ -230,116 +465,3 @@ class DepthMemPolicy(Gr00tPolicy):
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
         return casted_action, {}
-
-    def _warm_up_cache(self, observation: dict[str, Any]):
-        """Run a forward pass with cache injection to populate KV cache.
-
-        Called once after the first step to warm up the cache. Subsequent steps
-        will use cached KVs and only encode the current frame.
-        """
-        unbatched_observations = self._unbatch_observation(observation)
-        processed_inputs = []
-
-        for obs in unbatched_observations:
-            vla_step_data = self._to_vla_step_data(obs)
-            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
-            processed_inputs.append(self.processor(messages))
-
-        collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
-
-        # Inject the (empty) cache dict — temporal_attention will populate it
-        collated_inputs["temporal_kv_cache"] = self.temporal_kv_cache
-
-        with torch.inference_mode():
-            self.model.get_action(**collated_inputs)
-
-        logger.info(f"KV cache warmed up with {len(self.temporal_kv_cache)} layer entries")
-
-    def _trim_kv_cache(self):
-        """Trim KV cache to keep only the last (T-1) frames' worth of KVs.
-
-        Each cache entry has shape [B*N, T_cached, D]. We keep only the last
-        (num_temporal_frames - 1) time steps, so the next step's current frame
-        makes it T total.
-        """
-        max_cached = self.num_temporal_frames - 1
-        for cache_key in self.temporal_kv_cache:
-            k, v = self.temporal_kv_cache[cache_key]
-            if k.shape[1] > max_cached:
-                self.temporal_kv_cache[cache_key] = (
-                    k[:, -max_cached:].contiguous(),
-                    v[:, -max_cached:].contiguous(),
-                )
-
-    def _to_vla_step_data_current_only(self, observation: dict[str, Any]) -> VLAStepData:
-        """Create VLAStepData with only the current frame and its depth.
-
-        Used when KV cache is warm — past frames are already cached, so we
-        only need to encode the current frame through SigLIP2.
-        """
-        video_keys = list(observation["video"].keys())
-        primary_key = video_keys[0] if video_keys else None
-
-        if primary_key is not None:
-            current_frames = observation["video"][primary_key]
-            if current_frames.ndim == 4:
-                for t in range(current_frames.shape[0]):
-                    self.rgb_buffer.append(current_frames[t])
-            elif current_frames.ndim == 3:
-                self.rgb_buffer.append(current_frames)
-
-        step_data = VLAStepData(
-            images=observation["video"],
-            states=observation["state"],
-            actions={},
-            text=observation["language"][self.language_key][0],
-            embodiment=self.embodiment_tag,
-        )
-
-        # Generate depth for current frame only (but use full buffer for temporal consistency)
-        if len(self.rgb_buffer) > 0:
-            buffer_frames = np.stack(list(self.rgb_buffer))
-            depth_maps = self._generate_depth_maps(buffer_frames)
-            # Only pass the current (last) frame's depth
-            step_data.depth_maps = depth_maps[-1:]  # [1, H, W]
-            step_data.num_temporal_frames = 1
-
-        return step_data
-
-    def _to_vla_step_data(self, observation: dict[str, Any]) -> VLAStepData:
-        """Convert observation to VLAStepData, adding depth maps.
-
-        Override to inject depth information into the processing pipeline.
-        """
-        # Get the RGB images from the video observation
-        video_keys = list(observation["video"].keys())
-        primary_key = video_keys[0] if video_keys else None
-
-        if primary_key is not None:
-            # Get current frame: observation video is [T, H, W, C]
-            current_frames = observation["video"][primary_key]
-            # Add current frame(s) to buffer
-            if current_frames.ndim == 4:  # [T, H, W, C]
-                for t in range(current_frames.shape[0]):
-                    self.rgb_buffer.append(current_frames[t])
-            elif current_frames.ndim == 3:  # [H, W, C]
-                self.rgb_buffer.append(current_frames)
-
-        # Create base VLAStepData
-        step_data = VLAStepData(
-            images=observation["video"],
-            states=observation["state"],
-            actions={},
-            text=observation["language"][self.language_key][0],
-            embodiment=self.embodiment_tag,
-        )
-
-        # Generate depth maps from buffer
-        if len(self.rgb_buffer) > 0:
-            buffer_frames = np.stack(list(self.rgb_buffer))  # [T', H, W, 3]
-            depth_maps = self._generate_depth_maps(buffer_frames)
-            step_data.depth_maps = depth_maps
-            step_data.num_temporal_frames = len(self.rgb_buffer)
-
-        return step_data

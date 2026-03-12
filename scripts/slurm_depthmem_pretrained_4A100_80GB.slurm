@@ -1,14 +1,14 @@
 #!/bin/bash
 
-#SBATCH --job-name=depth_T1_train
+#SBATCH --job-name=depthmem_pt
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=200000M
 #SBATCH --time=3-00:00:00
-#SBATCH --output=logs_depthmem/%x_%j.out
-#SBATCH --error=logs_depthmem/%x_%j.err
+#SBATCH --output=logs_depthmem_pt/%x_%j.out
+#SBATCH --error=logs_depthmem_pt/%x_%j.err
 #SBATCH --export=ALL
 
 set -eo pipefail
@@ -18,17 +18,17 @@ DOCKER_IMAGE="dltkdh9845/gr00t-depthmem:latest"
 CODE_DIR="/home2/leesangoh/Isaac-GR00T"     # gr00t code (bind-mounted, editable)
 DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
 DEPTH_DIR="/home2/leesangoh/datasets/bridge_depth_maps"
-MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-bridge"
-OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depth-T1"
+MODEL_PATH="nvidia/GR00T-N1.6-3B"           # HuggingFace pretrained (auto-download)
+OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-depthmem-pretrained"
+HF_CACHE="/home2/leesangoh/.cache/huggingface"
 export WANDB_API_KEY="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"
 
-# ── Training hyperparams (A100 80GB × 4, T=1 per-frame RGBD) ────────────
-# T=1 uses ~16× less memory per sample than T=16, so we can use larger batch
+# ── Training hyperparams (A100 80GB × 4) ────────────────────────────────
 NUM_GPUS=4
-MAX_STEPS=72000          # ~3 epochs (1.52M samples × 3 / 64 eff batch)
-GLOBAL_BATCH_SIZE=64     # micro_batch = 64/4GPUs = 16 per GPU (T=1, only 1 frame)
-GRAD_ACCUM=1             # effective batch = 64 × 1 = 64
-SAVE_STEPS=1000          # checkpoint every ~1h
+MAX_STEPS=108000         # ~4.5 epochs
+GLOBAL_BATCH_SIZE=32     # micro_batch = 32/4GPUs = 8 per GPU (8×16frames = 128 imgs/fwd)
+GRAD_ACCUM=2             # effective batch = 32 × 2 = 64
+SAVE_STEPS=1000          # checkpoint every 1000 steps
 
 # ── GPU / CPU detection ─────────────────────────────────────────────────
 UUIDLIST=$(nvidia-smi -L | cut -d '(' -f 2 | awk '{print$2}' | tr -d ")" | paste -s -d, -)
@@ -39,41 +39,40 @@ echo "GPUs: ${UUIDLIST}"
 echo "CPUs: ${CPULIST}"
 nvidia-smi
 
-mkdir -p logs_depthmem
+mkdir -p logs_depthmem_pt
 
 docker pull ${DOCKER_IMAGE}
 
 # ── Run training in Docker ──────────────────────────────────────────────
-# Kill any existing container with the same name
-docker rm -f ${USER}_depth_T1_${SLURM_JOB_ID} 2>/dev/null || true
-
+# Model is auto-downloaded from HuggingFace on first run and cached in HF_CACHE.
 # Resume is automatic: if OUTPUT_DIR has a checkpoint, training continues from it.
 docker run --rm \
   --gpus ${GPULIST} \
   --cpuset-cpus ${CPULIST} \
   --ipc=host \
   --network host \
-  --name ${USER}_depth_T1_${SLURM_JOB_ID} \
+  --name ${USER}_depthmem_pt_${SLURM_JOB_ID} \
   -e WANDB_API_KEY \
   -e NCCL_TIMEOUT=3600 \
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \
+  -e HF_HOME=/cache/huggingface \
   -v ${CODE_DIR}:/workspace/gr00t \
   -v ${DATA_DIR}:/data/bridge_lerobot \
   -v ${DEPTH_DIR}:/data/bridge_depth_maps \
-  -v ${MODEL_PATH}:/checkpoints/GR00T-N1.6-bridge \
-  -v ${OUTPUT_DIR}:/checkpoints/GR00T-N1.6-depth-T1 \
+  -v ${OUTPUT_DIR}:/checkpoints/GR00T-N1.6-depthmem-pretrained \
+  -v ${HF_CACHE}:/cache/huggingface \
   ${DOCKER_IMAGE} \
   bash -lc '
     set -euo pipefail
     cd /workspace/gr00t
 
-    torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29501 \
+    torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29500 \
       gr00t/experiment/launch_finetune.py \
-      --base_model_path /checkpoints/GR00T-N1.6-bridge \
+      --base_model_path '"${MODEL_PATH}"' \
       --dataset_path /data/bridge_lerobot \
       --embodiment_tag OXE_WIDOWX \
       --num_gpus '"${NUM_GPUS}"' \
-      --output_dir /checkpoints/GR00T-N1.6-depth-T1 \
+      --output_dir /checkpoints/GR00T-N1.6-depthmem-pretrained \
       --max_steps '"${MAX_STEPS}"' \
       --global_batch_size '"${GLOBAL_BATCH_SIZE}"' \
       --gradient_accumulation_steps '"${GRAD_ACCUM}"' \
@@ -89,7 +88,7 @@ docker run --rm \
       --gradient_checkpointing \
       --action_horizon 8 \
       --depthmem_enabled \
-      --depthmem_num_temporal_frames 1 \
+      --depthmem_num_temporal_frames 16 \
       --depthmem_depth_dir /data/bridge_depth_maps \
       --depthmem_lora_rank 16 \
       --video_backend ffmpeg \

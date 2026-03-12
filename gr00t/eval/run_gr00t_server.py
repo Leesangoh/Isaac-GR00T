@@ -58,6 +58,25 @@ class ServerConfig:
     attention_map_dir: str = "./attention_maps"
     """Directory to save attention map images."""
 
+    # DepthMem configs
+    depthmem: bool = False
+    """Enable DepthMem policy (depth + temporal attention)."""
+
+    depthmem_num_temporal_frames: int = 16
+    """Number of temporal frames for depth estimation buffer."""
+
+    depthmem_depth_model_size: str = "small"
+    """Video Depth Anything model size: small, base, large."""
+
+    depthmem_depth_resolution: int = 224
+    """Input resolution for depth model."""
+
+    depthmem_save_video_dir: str | None = None
+    """Directory to save RGB|Depth side-by-side episode videos."""
+
+    depthmem_video_fps: int = 10
+    """FPS for saved episode videos."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T inference server...")
@@ -73,14 +92,34 @@ def main(config: ServerConfig):
 
     # Create and start the server
     if config.model_path is not None:
-        policy = Gr00tPolicy(
-            embodiment_tag=config.embodiment_tag,
-            model_path=config.model_path,
-            device=config.device,
-            strict=config.strict,
-            save_attention_map=config.save_attention_map,
-            attention_map_dir=config.attention_map_dir,
-        )
+        if config.depthmem:
+            from gr00t.policy.depthmem_policy import DepthMemPolicy
+
+            policy = DepthMemPolicy(
+                embodiment_tag=config.embodiment_tag,
+                model_path=config.model_path,
+                device=config.device,
+                strict=config.strict,
+                num_temporal_frames=config.depthmem_num_temporal_frames,
+                depth_model_size=config.depthmem_depth_model_size,
+                depth_resolution=config.depthmem_depth_resolution,
+                save_attention_map=config.save_attention_map,
+                attention_map_dir=config.attention_map_dir,
+                save_video_dir=config.depthmem_save_video_dir,
+                video_fps=config.depthmem_video_fps,
+            )
+            print(
+                f"  DepthMem: T={config.depthmem_num_temporal_frames}, depth_model={config.depthmem_depth_model_size}"
+            )
+        else:
+            policy = Gr00tPolicy(
+                embodiment_tag=config.embodiment_tag,
+                model_path=config.model_path,
+                device=config.device,
+                strict=config.strict,
+                save_attention_map=config.save_attention_map,
+                attention_map_dir=config.attention_map_dir,
+            )
         if config.denoising_steps is not None:
             for module in policy.model.modules():
                 if hasattr(module, "num_inference_timesteps"):
@@ -121,6 +160,13 @@ def main(config: ServerConfig):
         server.run()
     except KeyboardInterrupt:
         print("\nShutting down server...")
+    finally:
+        # Flush any remaining episode video
+        if config.depthmem and hasattr(policy, "policy"):
+            # policy is Gr00tSimPolicyWrapper -> policy.policy is DepthMemPolicy
+            inner = policy.policy if hasattr(policy, "policy") else policy
+            if hasattr(inner, "_flush_all_videos"):
+                inner._flush_all_videos()
 
 
 if __name__ == "__main__":
