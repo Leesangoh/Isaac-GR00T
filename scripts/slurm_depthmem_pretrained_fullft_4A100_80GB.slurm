@@ -26,12 +26,12 @@ export WANDB_API_KEY="wandb_v1_TtutYHjnUFsuKnxxfV99W9rYIVr_egSjaiHOLWG5uQeZXsbMp
 # ── Training hyperparams (A100 80GB x 4, FULL fine-tuning) ──────────────
 # Full FT trains ALL 3B params (LLM + vision + projector + DiT).
 # ZeRO-2 shards optimizer states across 4 GPUs (~6GB/GPU for Adam).
-# micro_batch = 16/4GPUs = 4 per GPU (4x16frames = 64 imgs/fwd)
-# With gradient checkpointing, ~60-70GB VRAM per GPU expected.
+# micro_batch = 32/4GPUs = 8 per GPU (8x16frames = 128 imgs/fwd)
+# With gradient checkpointing, ~55-60GB VRAM per GPU expected.
 NUM_GPUS=4
 MAX_STEPS=108000         # ~4.5 epochs
-GLOBAL_BATCH_SIZE=16     # micro_batch = 16/4GPUs = 4 per GPU
-GRAD_ACCUM=4             # effective batch = 16 x 4 = 64
+GLOBAL_BATCH_SIZE=32     # micro_batch = 32/4GPUs = 8 per GPU
+GRAD_ACCUM=2             # effective batch = 32 x 2 = 64
 SAVE_STEPS=1000          # checkpoint every ~1000 steps
 
 # ── GPU / CPU detection ─────────────────────────────────────────────────
