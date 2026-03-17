@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=physrepa_train
+#SBATCH --job-name=bridge_no_physrepa
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
@@ -18,8 +18,7 @@ DOCKER_IMAGE="dltkdh9845/gr00t-physrepa:latest"
 CODE_DIR="/home2/leesangoh/Isaac-GR00T"
 DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
 MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-3B"
-OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-physrepa-vitl"
-FEATURES_DIR="/home2/leesangoh/features/vjepa2_vitl"
+OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-no-physrepa"
 export WANDB_API_KEY="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"
 
 # ── Training hyperparams (A100 80GB × 4) ────────────────────────────────
@@ -40,7 +39,7 @@ nvidia-smi
 mkdir -p logs_physrepa
 
 # ── Container naming & cleanup ──────────────────────────────────────────
-CONTAINER_NAME="${SLURM_JOB_USER}_job_${SLURM_JOB_ID}_physrepa"
+CONTAINER_NAME="${SLURM_JOB_USER}_job_${SLURM_JOB_ID}_no_physrepa"
 cleanup() {
   docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
 }
@@ -60,15 +59,11 @@ docker run \
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \
   -v ${CODE_DIR}:/workspace/gr00t \
   -v ${DATA_DIR}:/data/bridge_lerobot \
-  -v ${OUTPUT_DIR}:/checkpoints/GR00T-N1.6-physrepa-vitl \
-  -v ${FEATURES_DIR}:/data/vjepa2_features \
+  -v ${OUTPUT_DIR}:/checkpoints/GR00T-N1.6-no-physrepa \
   ${DOCKER_IMAGE} \
   bash -lc '
     set -euo pipefail
     cd /workspace/gr00t
-
-    # Re-install gr00t as editable so the mounted code is used
-    uv pip install --no-deps -e . 2>&1 | tail -3
 
     torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29500 \
       gr00t/experiment/launch_finetune.py \
@@ -76,7 +71,7 @@ docker run \
       --dataset_path /data/bridge_lerobot \
       --embodiment_tag OXE_WIDOWX \
       --num_gpus '"${NUM_GPUS}"' \
-      --output_dir /checkpoints/GR00T-N1.6-physrepa-vitl \
+      --output_dir /checkpoints/GR00T-N1.6-no-physrepa \
       --max_steps '"${MAX_STEPS}"' \
       --global_batch_size '"${GLOBAL_BATCH_SIZE}"' \
       --learning_rate 1e-4 \
@@ -87,11 +82,5 @@ docker run \
       --dataloader_num_workers 4 \
       --save_steps '"${SAVE_STEPS}"' \
       --save_total_limit 5 \
-      --use_wandb \
-      --physrepa-enabled \
-      --physrepa-lambda 0.5 \
-      --physrepa-vjepa-features-dir /data/vjepa2_features \
-      --physrepa-vjepa-layer 10 \
-      --physrepa-vjepa-dim 1024 \
-      --physrepa-align-layers 0 1 2 3 4 5 6 7 8
+      --use_wandb
   '
