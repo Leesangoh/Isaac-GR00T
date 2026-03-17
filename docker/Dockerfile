@@ -13,8 +13,17 @@ RUN sed -i s/dill==0.3.9/dill==0.3.8/g /etc/pip/constraint.txt
 RUN sed -i s/scipy==1.15.2/scipy==1.15.3/g /etc/pip/constraint.txt
 RUN pip install imageio h5py boto3 transformers[torch] deepspeed timm peft diffusers wandb tianshou dm_tree openai albumentations==1.4.18 decord==0.6.0 torchcodec==0.4.0 safetensors
 
-COPY src/gr00t/ /workspace/gr00t/
-RUN cd /workspace/gr00t && uv sync && uv pip install -e .
+COPY src/gr00t/ /opt/gr00t-build/
+RUN cd /opt/gr00t-build && uv sync && \
+    cp -r /opt/gr00t-build/.venv /opt/gr00t-venv && \
+    rm -rf /opt/gr00t-build && \
+    # Fix torchrun shebang to point to the new venv location
+    sed -i '1s|.*|#!/opt/gr00t-venv/bin/python|' /opt/gr00t-venv/bin/torchrun
+
+# Auto-activate venv for login shells (bash -l)
+RUN echo 'source /opt/gr00t-venv/bin/activate' >> /etc/bash.bashrc
+ENV PATH="/opt/gr00t-venv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/gr00t-venv"
 
 RUN apt-get update && apt-get install -y libegl1
 RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \

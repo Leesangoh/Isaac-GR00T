@@ -68,6 +68,9 @@ docker run \
     set -euo pipefail
     cd /workspace/gr00t
 
+    # Re-install gr00t as editable so the mounted code is used
+    uv pip install --no-deps -e . 2>&1 | tail -3
+
     torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29500 \
       gr00t/experiment/launch_finetune.py \
       --base_model_path /checkpoints/GR00T-N1.6-bridge \
