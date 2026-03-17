@@ -20,11 +20,12 @@ DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
 MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-3B"
 OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-physrepa-vitl"
 FEATURES_DIR="/home2/leesangoh/features/vjepa2_vitl"
+export WANDB_NAME="physrepa_bridge_100k"
 export WANDB_API_KEY="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"
 
 # ── Training hyperparams (A100 80GB × 4) ────────────────────────────────
 NUM_GPUS=4
-MAX_STEPS=20000
+MAX_STEPS=100000
 GLOBAL_BATCH_SIZE=512
 SAVE_STEPS=1000
 
@@ -56,6 +57,7 @@ docker run \
   --network host \
   --name ${CONTAINER_NAME} \
   -e WANDB_API_KEY \
+  -e WANDB_NAME \
   -e NCCL_TIMEOUT=3600 \
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \
   -v ${CODE_DIR}:/workspace/gr00t \
