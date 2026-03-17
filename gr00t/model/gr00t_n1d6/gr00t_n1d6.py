@@ -7,6 +7,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.model.modules.physrepa import PhysREPAHead
 import torch
 from torch import nn
 from torch.distributions import Beta
@@ -83,6 +84,11 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
+
+        # PhysREPA alignment head (optional)
+        self.physrepa_head = None
+        self.physrepa_lambda = 0.0
+
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -117,6 +123,18 @@ class Gr00tN1d6ActionHead(nn.Module):
                     print(f"Action head trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
+
+    def enable_physrepa(self, physrepa_lambda=0.5, vjepa_dim=1024, align_layers=None):
+        """Enable PhysREPA alignment loss."""
+        dit_dim = self.input_embedding_dim
+        self.physrepa_head = PhysREPAHead(
+            dit_dim=dit_dim, vjepa_dim=vjepa_dim, align_layers=align_layers
+        )
+        self.physrepa_lambda = physrepa_lambda
+        print(
+            f"PhysREPA enabled: lambda={physrepa_lambda}, dit_dim={dit_dim}, "
+            f"vjepa_dim={vjepa_dim}, align_layers={align_layers}"
+        )
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -221,7 +239,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         if self.config.use_alternate_vl_dit:
             image_mask = backbone_output.image_mask
             backbone_attention_mask = backbone_output.backbone_attention_mask
-            model_output, _ = self.model(
+            model_output, all_hidden_states = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
@@ -231,7 +249,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 backbone_attention_mask=backbone_attention_mask,
             )
         else:
-            model_output, _ = self.model(
+            model_output, all_hidden_states = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
@@ -245,15 +263,27 @@ class Gr00tN1d6ActionHead(nn.Module):
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        flow_loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
-        return {
-            "loss": loss,
+        # PhysREPA alignment loss
+        result = {
+            "loss": flow_loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+
+        vjepa_features = getattr(action_input, "vjepa_features", None)
+        if self.physrepa_head is not None and vjepa_features is not None:
+            repa_loss, repa_metrics = self.physrepa_head(all_hidden_states, vjepa_features)
+            result["loss"] = flow_loss + self.physrepa_lambda * repa_loss
+            result["repa_loss"] = repa_loss
+            result["flow_loss"] = flow_loss
+            result["physrepa_lambda"] = self.physrepa_lambda
+            result["repa_metrics"] = repa_metrics
+
+        return result
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
@@ -478,8 +508,16 @@ class Gr00tN1d6(PreTrainedModel):
             inputs.pop("vlm_content")
             inputs.update(prep)
 
+        # Extract metadata and vjepa_features before passing to sub-modules
+        inputs.pop("metadata", None)
+        vjepa_features = inputs.pop("vjepa_features", None)
+
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
+
+        # Re-attach vjepa_features to action_inputs for PhysREPA
+        if vjepa_features is not None:
+            action_inputs["vjepa_features"] = vjepa_features
 
         # Move to device and dtype
         def to_device_with_dtype(x):

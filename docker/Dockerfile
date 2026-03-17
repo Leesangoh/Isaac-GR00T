@@ -11,10 +11,7 @@ RUN pip install --upgrade pip setuptools
 RUN pip install uv
 RUN sed -i s/dill==0.3.9/dill==0.3.8/g /etc/pip/constraint.txt
 RUN sed -i s/scipy==1.15.2/scipy==1.15.3/g /etc/pip/constraint.txt
-RUN pip install imageio h5py boto3 transformers[torch] deepspeed timm peft diffusers wandb tianshou dm_tree openai albumentations==1.4.18 decord==0.6.0 torchcodec==0.4.0
-RUN mkdir -p /opt
-RUN cd /opt && git clone https://github.com/facebookresearch/pytorch3d.git
-RUN cd /opt/pytorch3d && pip install .
+RUN pip install imageio h5py boto3 transformers[torch] deepspeed timm peft diffusers wandb tianshou dm_tree openai albumentations==1.4.18 decord==0.6.0 torchcodec==0.4.0 safetensors
 
 COPY src/gr00t/ /workspace/gr00t/
 RUN cd /workspace/gr00t && uv sync && uv pip install -e .

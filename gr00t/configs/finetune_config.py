@@ -116,3 +116,22 @@ class FinetuneConfig:
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+
+    # --- PhysREPA Configuration ---
+    physrepa_enabled: bool = False
+    """If True, add PhysREPA alignment loss during training."""
+
+    physrepa_lambda: float = 0.5
+    """Weight for the PhysREPA alignment loss."""
+
+    physrepa_vjepa_features_dir: str | None = None
+    """Directory containing pre-extracted V-JEPA 2 features."""
+
+    physrepa_vjepa_layer: int = 10
+    """V-JEPA 2 layer to use for alignment (PEZ layer)."""
+
+    physrepa_vjepa_dim: int = 1024
+    """V-JEPA 2-L embedding dimension."""
+
+    physrepa_align_layers: list[int] | None = None
+    """DiT layers to align. Default: [0..8]."""

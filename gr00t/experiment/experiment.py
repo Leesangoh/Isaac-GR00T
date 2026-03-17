@@ -97,7 +97,7 @@ def warn_configs(config: Config):
         )
 
 
-def run(config: Config):
+def run(config: Config, ft_config=None):
     warn_configs(config)
 
     """Main training function."""
@@ -175,6 +175,26 @@ def run(config: Config):
     processor = pipeline.return_processor()
     processor.save_pretrained(processor_dir)
 
+    # PhysREPA setup
+    physrepa_feature_loader = None
+    if ft_config is not None and getattr(ft_config, "physrepa_enabled", False):
+        from gr00t.data.physrepa_feature_loader import PhysREPAFeatureLoader
+
+        align_layers = ft_config.physrepa_align_layers or list(range(9))
+        model.action_head.enable_physrepa(
+            physrepa_lambda=ft_config.physrepa_lambda,
+            vjepa_dim=ft_config.physrepa_vjepa_dim,
+            align_layers=align_layers,
+        )
+        physrepa_feature_loader = PhysREPAFeatureLoader(
+            features_dir=ft_config.physrepa_vjepa_features_dir,
+            vjepa_layer=ft_config.physrepa_vjepa_layer,
+        )
+        logging.info(
+            f"PhysREPA enabled: lambda={ft_config.physrepa_lambda}, "
+            f"features_dir={ft_config.physrepa_vjepa_features_dir}"
+        )
+
     # deepspeed config
     if config.training.num_gpus > 1 and not config.training.use_ddp:
         deepspeed_config = config.get_deepspeed_config()
@@ -228,6 +248,7 @@ def run(config: Config):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
+        physrepa_feature_loader=physrepa_feature_loader,
     )
 
     trainer.add_callback(

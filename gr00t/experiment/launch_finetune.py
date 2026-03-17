@@ -89,4 +89,4 @@ if __name__ == "__main__":
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
 
-    run(config)
+    run(config, ft_config=ft_config)

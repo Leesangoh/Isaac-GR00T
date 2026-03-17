@@ -96,6 +96,9 @@ class Gr00tN1d6DataCollator:
                     batch[k] = v
             elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
                 raise Exception("Not implemented")
+            elif key == "metadata":
+                # Collect metadata as a list (not stackable)
+                batch[key] = values
             else:
                 # state, state_mask, action and action_mask - stack to form batch dimension
                 batch[key] = torch.from_numpy(np.stack(values))
@@ -386,6 +389,9 @@ class Gr00tN1d6Processor(BaseProcessor):
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+        # Propagate metadata (e.g. episode_idx, step_index for PhysREPA)
+        if content.metadata:
+            transformed_inputs["metadata"] = content.metadata
         return transformed_inputs
 
     def _get_vlm_inputs(

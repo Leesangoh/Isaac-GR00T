@@ -16,6 +16,7 @@ def extract_step_data(
     modality_configs: dict[str, ModalityConfig],
     embodiment_tag: EmbodimentTag,
     allow_padding: bool = False,
+    episode_idx: int | None = None,
 ) -> VLAStepData:
     step_data = {}
 
@@ -53,12 +54,18 @@ def extract_step_data(
     assert len(language_data) == 1, f"Expected 1 language, got {len(language_data)}"
     text = language_data[list(language_data.keys())[0]][0]
 
+    metadata = {}
+    if episode_idx is not None:
+        metadata["episode_idx"] = episode_idx
+    metadata["step_index"] = step_index
+
     vla_step_data = VLAStepData(
         images=video_data,
         states=state_data,
         actions=action_data,
         text=text,
         embodiment=embodiment_tag,
+        metadata=metadata,
     )
     return vla_step_data
 
@@ -214,7 +221,9 @@ class ShardedSingleStepDataset(ShardedDataset):
         """Return the number of shards in the dataset."""
         return len(self.shard_lengths)
 
-    def get_datapoint(self, episode_data: pd.DataFrame, step_index: int) -> dict:
+    def get_datapoint(
+        self, episode_data: pd.DataFrame, step_index: int, ep_idx: int | None = None
+    ) -> dict:
         """
         Extract and process a single timestep from episode data.
 
@@ -233,7 +242,12 @@ class ShardedSingleStepDataset(ShardedDataset):
         """
         assert self.processor is not None, "Processor must be set before getting datapoints"
         vla_step_data = extract_step_data(
-            episode_data, step_index, self.modality_configs, self.embodiment_tag, self.allow_padding
+            episode_data,
+            step_index,
+            self.modality_configs,
+            self.embodiment_tag,
+            self.allow_padding,
+            episode_idx=ep_idx,
         )
         # Apply processor to convert to model inputs
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
@@ -262,7 +276,7 @@ class ShardedSingleStepDataset(ShardedDataset):
             # Load episode data once per episode in shard
             episode_data = self.episode_loader[ep_idx]
             for step_index in step_indices:
-                datapoints.append(self.get_datapoint(episode_data, step_index))
+                datapoints.append(self.get_datapoint(episode_data, step_index, ep_idx=ep_idx))
         return datapoints
 
     def get_dataset_statistics(self) -> dict:

@@ -190,6 +190,8 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        self.physrepa_feature_loader = kwargs.pop("physrepa_feature_loader", None)
+        self._physrepa_init_hidden = None
         super().__init__(
             *args,
             **kwargs,
@@ -285,6 +287,20 @@ class Gr00tTrainer(Trainer):
         *and* model outputs, we calculate accuracy and push it to the logger.
         """
 
+        # PhysREPA: inject V-JEPA features into inputs if available
+        # inputs from collator is {"inputs": batch_dict}, so look inside
+        if self.physrepa_feature_loader is not None:
+            inner = inputs.get("inputs", inputs)
+            if "metadata" in inner:
+                metadata_list = inner["metadata"]
+                device = next(model.parameters()).device
+                dtype = next(model.parameters()).dtype
+                vjepa_features = self.physrepa_feature_loader.get_batch_features(
+                    metadata_list, device, dtype
+                )
+                if vjepa_features is not None:
+                    inner["vjepa_features"] = vjepa_features
+
         # Use parent implementation to preserve built-in functionality.
         loss, outputs = super().compute_loss(
             model,
@@ -292,15 +308,60 @@ class Gr00tTrainer(Trainer):
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
-        # import ipdb; ipdb.set_trace()
-        # # save the model's embedding for the first step
-        # input_embeddings = model.get_input_embeddings().weight.data.cpu()
-        # output_embeddings = model.get_output_embeddings().weight.data.cpu()
-        # torch.save(input_embeddings, f"input_embeddings_{self.state.global_step}.pt")
-        # torch.save(output_embeddings, f"output_embeddings_{self.state.global_step}.pt")
 
         # Record last loss for testing purposes.
         self.loss = loss
+
+        # PhysREPA: comprehensive logging
+        if isinstance(outputs, dict) and "repa_loss" in outputs:
+            should_log = (
+                self.state.global_step % self.args.logging_steps == 0
+                and model.training
+                and self.args.local_rank in (-1, 0)
+            )
+
+            # Cache initial DiT hidden norms at step 0 for drift monitoring
+            if self.state.global_step == 0 and "repa_metrics" in outputs:
+                self._physrepa_init_hidden = {}
+                for k, v in outputs["repa_metrics"].items():
+                    if k.startswith("dit/") and k.endswith("_hidden_norm"):
+                        self._physrepa_init_hidden[k] = v.item()
+
+            if should_log:
+                repa_log = {}
+
+                # 1. Loss breakdown
+                repa_log["flow_loss"] = outputs["flow_loss"].detach().item()
+                repa_log["repa_loss"] = outputs["repa_loss"].detach().item()
+                repa_log["total_loss"] = loss.detach().item()
+                repa_log["physrepa_lambda"] = outputs.get("physrepa_lambda", 0.5)
+
+                # 2. Per-layer alignment + DiT hidden norms
+                if "repa_metrics" in outputs:
+                    for k, v in outputs["repa_metrics"].items():
+                        repa_log[k] = v.item() if hasattr(v, "item") else v
+
+                # 3. Projection head weight/grad norms
+                action_head = (
+                    model.module.action_head if hasattr(model, "module") else model.action_head
+                )
+                if hasattr(action_head, "physrepa_head") and action_head.physrepa_head is not None:
+                    monitor_metrics = action_head.physrepa_head.get_monitoring_metrics()
+                    repa_log.update(monitor_metrics)
+
+                # 4. DiT hidden norm drift from init
+                if self._physrepa_init_hidden:
+                    for k, init_val in self._physrepa_init_hidden.items():
+                        if k in repa_log:
+                            drift = abs(repa_log[k] - init_val) / (init_val + 1e-8)
+                            layer_str = k.replace("dit/", "").replace("_hidden_norm", "")
+                            repa_log[f"dit/{layer_str}_norm_drift_pct"] = drift * 100
+
+                # 5. GPU memory
+                if torch.cuda.is_available():
+                    repa_log["gpu_memory_allocated_gb"] = torch.cuda.memory_allocated() / 1024**3
+
+                self.log(repa_log)
 
         # --------------------------------------------------------------
         # Accuracy calculation
