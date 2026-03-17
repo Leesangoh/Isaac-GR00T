@@ -117,6 +117,9 @@ class FinetuneConfig:
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
 
+    video_backend: str = "torchcodec"
+    """Video decoding backend. Use 'ffmpeg' for AV1-encoded datasets (e.g., bridge)."""
+
     # --- PhysREPA Configuration ---
     physrepa_enabled: bool = False
     """If True, add PhysREPA alignment loss during training."""

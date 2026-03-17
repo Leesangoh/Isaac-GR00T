@@ -1,48 +1,100 @@
-FROM nvcr.io/nvidia/pytorch:25.04-py3
+FROM nvcr.io/nvidia/cuda:12.6.3-devel-ubuntu22.04
 
 ENV NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
-    build-essential yasm cmake libtool git pkg-config \
+# ── Fix /tmp permissions (some CUDA base images restrict it) ─────────────
+RUN chmod 1777 /tmp
+
+# ── System deps ──────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential yasm cmake libtool git pkg-config curl \
     libass-dev libfreetype6-dev libvorbis-dev \
-    autoconf automake texinfo tmux ffmpeg
+    autoconf automake texinfo tmux ffmpeg libegl1 \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && add-apt-repository ppa:ubuntuhandbook1/ffmpeg6 \
+    && apt-get update \
+    && apt-get install -y python3.10 python3.10-venv python3.10-dev \
+    && apt-get upgrade -y ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools
-RUN pip install uv
-RUN sed -i s/dill==0.3.9/dill==0.3.8/g /etc/pip/constraint.txt
-RUN sed -i s/scipy==1.15.2/scipy==1.15.3/g /etc/pip/constraint.txt
-RUN pip install imageio h5py boto3 transformers[torch] deepspeed timm peft diffusers wandb tianshou dm_tree openai albumentations==1.4.18 decord==0.6.0 torchcodec==0.4.0 safetensors
+# ── Set Python 3.10 as default ──────────────────────────────────────────
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
 
-COPY src/gr00t/ /opt/gr00t-build/
-RUN cd /opt/gr00t-build && uv sync && \
-    cp -r /opt/gr00t-build/.venv /opt/gr00t-venv && \
-    rm -rf /opt/gr00t-build && \
-    # Fix torchrun shebang to point to the new venv location
-    sed -i '1s|.*|#!/opt/gr00t-venv/bin/python|' /opt/gr00t-venv/bin/torchrun
+# ── Python tooling ──────────────────────────────────────────────────────
+RUN pip install --upgrade pip setuptools wheel
 
-# Auto-activate venv for login shells (bash -l)
-RUN echo 'source /opt/gr00t-venv/bin/activate' >> /etc/bash.bashrc
-ENV PATH="/opt/gr00t-venv/bin:$PATH"
-ENV VIRTUAL_ENV="/opt/gr00t-venv"
+# ── Install gr00t dependencies (frozen versions) ────────────────────────
+# Core ML stack
+RUN pip install --no-cache-dir \
+    torch==2.7.1 torchvision==0.22.1 \
+    transformers==4.51.3 \
+    deepspeed==0.17.6 \
+    peft==0.17.1 \
+    diffusers==0.35.1 \
+    accelerate==1.12.0 \
+    timm==1.0.25
 
-RUN apt-get update && apt-get install -y libegl1
+# flash-attn needs special build (takes ~10 min)
+RUN pip install --no-cache-dir flash-attn==2.7.4.post1 --no-build-isolation
+
+# Data / video processing
+RUN pip install --no-cache-dir \
+    torchcodec==0.4.0 \
+    av==15.0.0 \
+    datasets==3.6.0 \
+    pandas==2.2.3 \
+    numpy==1.26.4 \
+    decord==0.6.0 \
+    imageio==2.37.2 \
+    imageio-ffmpeg==0.6.0 \
+    lmdb==1.7.5 \
+    msgpack==1.1.0 \
+    msgpack-numpy==0.4.8 \
+    dm-tree==0.1.8 \
+    pyarrow==23.0.1
+
+# Utilities
+RUN pip install --no-cache-dir \
+    tyro==0.9.17 \
+    wandb==0.23.0 \
+    omegaconf==2.3.0 \
+    click==8.1.8 \
+    albumentations==1.4.18 \
+    einops==0.8.1 \
+    scipy==1.15.3 \
+    matplotlib==3.10.1 \
+    gymnasium==1.2.2 \
+    pyzmq==27.0.1 \
+    termcolor==3.2.0 \
+    safetensors==0.7.0 \
+    rich==14.3.3 \
+    opencv-python-headless==4.11.0.86 \
+    scikit-image==0.25.2 \
+    torchmetrics==1.8.2 \
+    easydict==1.13 \
+    hydra-core==1.3.2 \
+    gdown==5.2.1
+
+
+# ── Register torchcodec bundled ffmpeg libs so forked workers can find them ──
+RUN echo "/usr/local/lib/python3.10/dist-packages/torchcodec" > /etc/ld.so.conf.d/torchcodec.conf && ldconfig
+
+# ── EGL / Vulkan ────────────────────────────────────────────────────────
 RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
-    cat >/usr/share/glvnd/egl_vendor.d/10_nvidia.json <<'EOF'
-{
-    "file_format_version" : "1.0.0",
-    "ICD" : {
-        "library_path" : "libEGL_nvidia.so.0"
-    }
-}
-EOF
+    echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+    > /usr/share/glvnd/egl_vendor.d/10_nvidia.json && \
+    mkdir -p /usr/share/vulkan/icd.d && \
+    echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.2.140"}}' \
+    > /usr/share/vulkan/icd.d/nvidia_icd.json
 
-RUN mkdir -p /usr/share/vulkan/icd.d && \
-    cat >/usr/share/vulkan/icd.d/nvidia_icd.json <<'EOF'
-{
-    "file_format_version": "1.0.0",
-    "ICD": {
-        "library_path": "libGLX_nvidia.so.0",
-        "api_version": "1.2.140"
-    }
-}
-EOF
+# ── Entrypoint: install gr00t editable on start ─────────────────────────
+RUN printf '#!/bin/bash\nset -e\nif [ -f /workspace/gr00t/pyproject.toml ]; then\n  pip install -e /workspace/gr00t --no-deps -q 2>/dev/null || true\nfi\nexec "$@"\n' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+WORKDIR /workspace
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
