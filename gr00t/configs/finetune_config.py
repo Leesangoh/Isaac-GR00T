@@ -138,3 +138,6 @@ class FinetuneConfig:
 
     physrepa_align_layers: list[int] | None = None
     """DiT layers to align. Default: [0..8]."""
+
+    physrepa_global_means_path: str | None = None
+    """Path to global_means.pt for mean centering V-JEPA features. If None, no centering."""

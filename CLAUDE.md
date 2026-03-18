@@ -80,5 +80,17 @@ There is no test suite; CI runs `ruff format --check .` and `ruff check .` only.
 - Experiment tracking with `wandb`
 - CLI parsing via `tyro`
 
+### PhysREPA (branch: PhysREPA)
+Physics-informed REPA alignment loss — aligns DiT early-layer hidden states with V-JEPA 2 representations via negative cosine similarity.
+
+- **Alignment module**: `gr00t/model/modules/physrepa.py` — `PhysREPAHead` with per-layer 2-layer MLP projectors
+- **Feature loader**: `gr00t/data/physrepa_feature_loader.py` — loads pre-extracted V-JEPA 2 features per (episode, timestep), supports global mean centering
+- **Integration**: `gr00t/model/gr00t_n1d6/gr00t_n1d6.py` — DiT returns `all_hidden_states`, PhysREPA loss added to flow loss
+- **Config**: `gr00t/configs/finetune_config.py` — `physrepa_*` flags (enabled, lambda, features_dir, vjepa_layer, vjepa_dim, align_layers, global_means_path)
+- **Feature extraction**: `scripts/physrepa/extract_vjepa2_features.py` — sliding-window V-JEPA 2 feature extraction (ViT-L: layers 8,10,12,23; ViT-G: layers 13,16,20,39)
+- **Global mean centering**: `scripts/physrepa/compute_global_means.py` — computes per-layer global mean vectors; required because raw V-JEPA features have >99% variance along the mean direction, trivially solving alignment
+- **Pre-extracted features**: `/mnt/md1/solee/features/vjepa2_vitl/` and `vjepa2_vitg/` (53,192 episodes each, safetensors format)
+- **Training scripts**: `scripts/physrepa/finetune_physrepa.sh`, `finetune_without_physrepa.sh`
+
 ### External Dependencies
 Git submodules in `external_dependencies/`: LIBERO, SimplerEnv, robocasa (benchmarks), GR00T-WholeBodyControl.

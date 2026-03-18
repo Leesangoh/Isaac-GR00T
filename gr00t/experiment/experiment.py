@@ -193,6 +193,7 @@ def run(config: Config, ft_config=None):
         physrepa_feature_loader = PhysREPAFeatureLoader(
             features_dir=ft_config.physrepa_vjepa_features_dir,
             vjepa_layer=ft_config.physrepa_vjepa_layer,
+            global_means_path=getattr(ft_config, "physrepa_global_means_path", None),
         )
         logging.info(
             f"PhysREPA enabled: lambda={ft_config.physrepa_lambda}, "
