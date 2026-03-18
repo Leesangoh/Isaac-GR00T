@@ -91,5 +91,6 @@ docker run \
       --physrepa-vjepa-features-dir /data/vjepa2_features \
       --physrepa-vjepa-layer 16 \
       --physrepa-vjepa-dim 1408 \
-      --physrepa-align-layers 0 1 2 3 4 5 6 7 8
+      --physrepa-align-layers 0 1 2 3 4 5 6 7 8 \
+      --physrepa-global-means-path /data/vjepa2_features/global_means.pt
   '

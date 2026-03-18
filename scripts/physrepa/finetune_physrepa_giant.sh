@@ -25,4 +25,5 @@ torchrun --nproc_per_node=$NUM_GPUS --master_port=29500 \
     --physrepa-vjepa-features-dir /mnt/md1/solee/features/vjepa2_vitg/ \
     --physrepa-vjepa-layer 16 \
     --physrepa-vjepa-dim 1408 \
-    --physrepa-align-layers 0 1 2 3 4 5 6 7 8
+    --physrepa-align-layers 0 1 2 3 4 5 6 7 8 \
+    --physrepa-global-means-path /mnt/md1/solee/features/vjepa2_vitg/global_means.pt
