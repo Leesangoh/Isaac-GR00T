@@ -4,6 +4,7 @@ Projects DiT early-layer hidden states to align with V-JEPA 2 PEZ representation
 via negative cosine similarity loss (following REPA paper).
 """
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -30,12 +31,14 @@ class PhysREPAHead(nn.Module):
         )
 
     def forward(self, all_hidden_states, vjepa_target):
-        """Compute alignment loss between DiT hidden states and V-JEPA features.
+        """Compute per-action-token alignment loss between DiT hidden states and V-JEPA features.
 
         Args:
             all_hidden_states: list of [B, seq_len, dit_dim] from DiT.
                 Index 0 = input, index i+1 = output of block i.
-            vjepa_target: [B, vjepa_dim] detached V-JEPA feature.
+                seq_len = state_horizon + action_horizon.
+            vjepa_target: [B, H, vjepa_dim] detached V-JEPA features per action timestep.
+                H = action_horizon.
 
         Returns:
             Tuple of (scalar loss, metrics dict).
@@ -44,22 +47,29 @@ class PhysREPAHead(nn.Module):
         losses = []
         metrics = {}
         vjepa_target = vjepa_target.detach()
+        action_horizon = vjepa_target.shape[1]
 
         for layer_idx_str, proj in self.projectors.items():
             layer_idx = int(layer_idx_str)
             # all_hidden_states[layer_idx + 1] = output of DiT block layer_idx
-            h = all_hidden_states[layer_idx + 1]  # [B, seq_len, dit_dim]
-            h_pooled = h.mean(dim=1)  # [B, dit_dim]
-            h_proj = proj(h_pooled)  # [B, vjepa_dim]
-            cos_sim = F.cosine_similarity(h_proj, vjepa_target, dim=-1)  # [B]
-            losses.append(-cos_sim.mean())
+            h = all_hidden_states[layer_idx + 1]  # [B, state_horizon+H, dit_dim]
+            h_actions = h[:, -action_horizon:, :]  # [B, H, dit_dim] — last H tokens are actions
+            h_proj = proj(h_actions)  # [B, H, vjepa_dim] — Linear works on last dim
+            cos_sims = F.cosine_similarity(h_proj, vjepa_target, dim=-1)  # [B, H]
+            losses.append(-cos_sims.mean())
 
             # Per-layer metrics (detached)
-            metrics[f"repa/layer_{layer_idx}_cosine_sim"] = cos_sim.mean().detach()
-            metrics[f"dit/layer_{layer_idx}_hidden_norm"] = h_pooled.detach().norm(dim=-1).mean()
+            metrics[f"repa/layer_{layer_idx}_cosine_sim"] = cos_sims.mean().detach()
+            metrics[f"dit/layer_{layer_idx}_hidden_norm"] = h_actions.detach().norm(dim=-1).mean()
 
         loss = sum(losses) / len(losses)
-        metrics["repa/mean_cosine_sim"] = -loss.detach()  # negate back to get actual cos_sim
+        metrics["repa/mean_cosine_sim"] = -loss.detach()
+
+        # Per-timestep metrics (averaged over layers and batch)
+        with torch.no_grad():
+            ts_cos = cos_sims.mean(dim=0)  # [H] from last layer — representative
+            metrics["repa/per_timestep_cosine_sim_min"] = ts_cos.min()
+            metrics["repa/per_timestep_cosine_sim_max"] = ts_cos.max()
 
         return loss, metrics
 
