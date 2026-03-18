@@ -68,7 +68,7 @@ docker run \
     cd /workspace/gr00t
     chmod -R 777 /checkpoints/GR00T-N1.6-physrepa-tsalign-vitg || true
 
-    torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29502 \
+    torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29504 \
       gr00t/experiment/launch_finetune.py \
       --base_model_path nvidia/GR00T-N1.6-3B \
       --dataset_path /data/bridge_lerobot \

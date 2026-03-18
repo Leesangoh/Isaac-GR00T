@@ -2,7 +2,7 @@ set -x -e
 
 export NUM_GPUS=4
 
-torchrun --nproc_per_node=$NUM_GPUS --master_port=29500 \
+torchrun --nproc_per_node=$NUM_GPUS --master_port=29504 \
     gr00t/experiment/launch_finetune.py \
     --base_model_path /mnt/md1/solee/checkpoints/GR00T-N1.6-bridge \
     --dataset_path /mnt/md1/solee/data/bridge_lerobot \
