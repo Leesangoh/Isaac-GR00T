@@ -48,6 +48,7 @@ class PhysREPAFeatureLoader:
                     f"PhysREPA: global_means_path {global_means_path} not found. Centering DISABLED."
                 )
         self.action_horizon = action_horizon
+        self.timestepwise = False
         self._sanity_checked = False
 
     @lru_cache(maxsize=512)
@@ -138,7 +139,10 @@ class PhysREPAFeatureLoader:
         return torch.stack(sequence)  # [action_horizon, vjepa_dim]
 
     def get_batch_features(self, metadata_list, device, dtype):
-        """Get V-JEPA features for a batch with per-timestep alignment.
+        """Get V-JEPA features for a batch, with optional global mean centering.
+
+        When self.timestepwise is True, returns per-action-token features [B, H, vjepa_dim].
+        When False, returns a single feature per sample [B, vjepa_dim] (original behavior).
 
         Args:
             metadata_list: list of dicts with 'episode_idx' and 'step_index' keys
@@ -146,8 +150,35 @@ class PhysREPAFeatureLoader:
             dtype: torch dtype
 
         Returns:
-            [B, action_horizon, vjepa_dim] tensor or None if any features are missing
+            [B, H, vjepa_dim] or [B, vjepa_dim] tensor, or None if any features are missing
         """
+        if self.timestepwise:
+            return self._get_batch_features_timestepwise(metadata_list, device, dtype)
+        return self._get_batch_features_meanpool(metadata_list, device, dtype)
+
+    def _get_batch_features_meanpool(self, metadata_list, device, dtype):
+        """Original mean-pool mode: one V-JEPA feature per sample → [B, vjepa_dim]."""
+        features = []
+        for meta in metadata_list:
+            ep_idx = meta.get("episode_idx")
+            step_idx = meta.get("step_index")
+            if ep_idx is None or step_idx is None:
+                return None
+            feat = self.get_feature(ep_idx, step_idx)
+            if feat is None:
+                return None
+            features.append(self._center(feat))
+        batch = torch.stack(features).to(device=device, dtype=dtype)
+
+        # One-time sanity check: verify centered features have ~0 mean cosine similarity
+        if not self._sanity_checked and self.global_mean is not None and len(features) >= 4:
+            self._sanity_checked = True
+            self._log_centering_check(batch)
+
+        return batch
+
+    def _get_batch_features_timestepwise(self, metadata_list, device, dtype):
+        """Timestep-wise mode: per-action-token features → [B, H, vjepa_dim]."""
         features = []
         for meta in metadata_list:
             ep_idx = meta.get("episode_idx")
@@ -163,20 +194,9 @@ class PhysREPAFeatureLoader:
         # One-time sanity check
         if not self._sanity_checked and self.global_mean is not None and len(features) >= 4:
             self._sanity_checked = True
+            self._log_centering_check(batch[:, 0, :])
+            # Verify targets differ across timesteps within a sample
             with torch.no_grad():
-                # Check centering on first timestep
-                first_ts = batch[:, 0, :].float()
-                normed = F.normalize(first_ts, dim=-1)
-                n = min(batch.shape[0], 16)
-                cos_matrix = normed[:n] @ normed[:n].T
-                mask = ~torch.eye(n, dtype=torch.bool, device=cos_matrix.device)
-                off_diag = cos_matrix[mask]
-                logging.info(
-                    f"PhysREPA sanity check (centered features, layer {self.vjepa_layer}): "
-                    f"pairwise cosine sim mean={off_diag.mean():.4f}, std={off_diag.std():.4f} "
-                    f"(should be ~0 if centering is effective)"
-                )
-                # Verify targets differ across timesteps within a sample
                 sample_targets = batch[0]  # [H, vjepa_dim]
                 ts_normed = F.normalize(sample_targets.float(), dim=-1)
                 ts_cos = ts_normed @ ts_normed.T  # [H, H]
@@ -190,3 +210,17 @@ class PhysREPAFeatureLoader:
                 )
 
         return batch
+
+    def _log_centering_check(self, features_2d):
+        """Log pairwise cosine similarity sanity check for centered features."""
+        with torch.no_grad():
+            normed = F.normalize(features_2d.float(), dim=-1)
+            n = min(features_2d.shape[0], 16)
+            cos_matrix = normed[:n] @ normed[:n].T
+            mask = ~torch.eye(n, dtype=torch.bool, device=cos_matrix.device)
+            off_diag = cos_matrix[mask]
+            logging.info(
+                f"PhysREPA sanity check (centered features, layer {self.vjepa_layer}): "
+                f"pairwise cosine sim mean={off_diag.mean():.4f}, std={off_diag.std():.4f} "
+                f"(should be ~0 if centering is effective)"
+            )

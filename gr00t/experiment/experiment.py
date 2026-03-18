@@ -190,14 +190,17 @@ def run(config: Config, ft_config=None):
             vjepa_dim=ft_config.physrepa_vjepa_dim,
             align_layers=align_layers,
         )
+        timestepwise = getattr(ft_config, "physrepa_timestepwise_align", False)
         physrepa_feature_loader = PhysREPAFeatureLoader(
             features_dir=ft_config.physrepa_vjepa_features_dir,
             vjepa_layer=ft_config.physrepa_vjepa_layer,
             global_means_path=getattr(ft_config, "physrepa_global_means_path", None),
             action_horizon=config.model.action_horizon,
         )
+        physrepa_feature_loader.timestepwise = timestepwise
         logging.info(
             f"PhysREPA enabled: lambda={ft_config.physrepa_lambda}, "
+            f"timestepwise={timestepwise}, "
             f"features_dir={ft_config.physrepa_vjepa_features_dir}"
         )
 

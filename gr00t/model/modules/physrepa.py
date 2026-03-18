@@ -31,19 +31,48 @@ class PhysREPAHead(nn.Module):
         )
 
     def forward(self, all_hidden_states, vjepa_target):
-        """Compute per-action-token alignment loss between DiT hidden states and V-JEPA features.
+        """Compute alignment loss between DiT hidden states and V-JEPA features.
+
+        Supports two modes based on vjepa_target shape:
+        - Mean-pool mode [B, vjepa_dim]: pool all DiT tokens, align to single target.
+        - Timestep-wise mode [B, H, vjepa_dim]: align each action token individually.
 
         Args:
             all_hidden_states: list of [B, seq_len, dit_dim] from DiT.
                 Index 0 = input, index i+1 = output of block i.
-                seq_len = state_horizon + action_horizon.
-            vjepa_target: [B, H, vjepa_dim] detached V-JEPA features per action timestep.
-                H = action_horizon.
+            vjepa_target: [B, vjepa_dim] or [B, H, vjepa_dim] detached V-JEPA features.
 
         Returns:
             Tuple of (scalar loss, metrics dict).
             Loss is -cos_sim (REPA paper convention). Range [-1, 1].
         """
+        if vjepa_target.dim() == 3:
+            return self._forward_timestepwise(all_hidden_states, vjepa_target)
+        return self._forward_meanpool(all_hidden_states, vjepa_target)
+
+    def _forward_meanpool(self, all_hidden_states, vjepa_target):
+        """Original mean-pool alignment: pool all tokens → align to [B, vjepa_dim]."""
+        losses = []
+        metrics = {}
+        vjepa_target = vjepa_target.detach()
+
+        for layer_idx_str, proj in self.projectors.items():
+            layer_idx = int(layer_idx_str)
+            h = all_hidden_states[layer_idx + 1]  # [B, seq_len, dit_dim]
+            h_pooled = h.mean(dim=1)  # [B, dit_dim]
+            h_proj = proj(h_pooled)  # [B, vjepa_dim]
+            cos_sim = F.cosine_similarity(h_proj, vjepa_target, dim=-1)  # [B]
+            losses.append(-cos_sim.mean())
+
+            metrics[f"repa/layer_{layer_idx}_cosine_sim"] = cos_sim.mean().detach()
+            metrics[f"dit/layer_{layer_idx}_hidden_norm"] = h_pooled.detach().norm(dim=-1).mean()
+
+        loss = sum(losses) / len(losses)
+        metrics["repa/mean_cosine_sim"] = -loss.detach()
+        return loss, metrics
+
+    def _forward_timestepwise(self, all_hidden_states, vjepa_target):
+        """Per-action-token alignment: each action token aligns to its V-JEPA target."""
         losses = []
         metrics = {}
         vjepa_target = vjepa_target.detach()
@@ -51,23 +80,21 @@ class PhysREPAHead(nn.Module):
 
         for layer_idx_str, proj in self.projectors.items():
             layer_idx = int(layer_idx_str)
-            # all_hidden_states[layer_idx + 1] = output of DiT block layer_idx
             h = all_hidden_states[layer_idx + 1]  # [B, state_horizon+H, dit_dim]
-            h_actions = h[:, -action_horizon:, :]  # [B, H, dit_dim] — last H tokens are actions
-            h_proj = proj(h_actions)  # [B, H, vjepa_dim] — Linear works on last dim
+            h_actions = h[:, -action_horizon:, :]  # [B, H, dit_dim]
+            h_proj = proj(h_actions)  # [B, H, vjepa_dim]
             cos_sims = F.cosine_similarity(h_proj, vjepa_target, dim=-1)  # [B, H]
             losses.append(-cos_sims.mean())
 
-            # Per-layer metrics (detached)
             metrics[f"repa/layer_{layer_idx}_cosine_sim"] = cos_sims.mean().detach()
             metrics[f"dit/layer_{layer_idx}_hidden_norm"] = h_actions.detach().norm(dim=-1).mean()
 
         loss = sum(losses) / len(losses)
         metrics["repa/mean_cosine_sim"] = -loss.detach()
 
-        # Per-timestep metrics (averaged over layers and batch)
+        # Per-timestep metrics from last layer
         with torch.no_grad():
-            ts_cos = cos_sims.mean(dim=0)  # [H] from last layer — representative
+            ts_cos = cos_sims.mean(dim=0)  # [H]
             metrics["repa/per_timestep_cosine_sim_min"] = ts_cos.min()
             metrics["repa/per_timestep_cosine_sim_max"] = ts_cos.max()
 

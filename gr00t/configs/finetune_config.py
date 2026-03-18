@@ -141,3 +141,8 @@ class FinetuneConfig:
 
     physrepa_global_means_path: str | None = None
     """Path to global_means.pt for mean centering V-JEPA features. If None, no centering."""
+
+    physrepa_timestepwise_align: bool = False
+    """If True, align each action token individually to its corresponding V-JEPA window
+    (per-timestep alignment). If False, mean-pool all DiT tokens and align to a single
+    V-JEPA feature (original behavior)."""
