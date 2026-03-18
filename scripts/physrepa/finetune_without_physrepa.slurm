@@ -19,12 +19,11 @@ CODE_DIR="/home2/leesangoh/Isaac-GR00T"
 DATA_DIR="/home2/leesangoh/datasets/bridge_lerobot"
 MODEL_PATH="/home2/leesangoh/checkpoints/GR00T-N1.6-3B"
 OUTPUT_DIR="/home2/leesangoh/checkpoints/GR00T-N1.6-no-physrepa"
-export WANDB_NAME="no_physrepa_bridge_100k"
 export WANDB_API_KEY="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"
 
 # ── Training hyperparams (A100 80GB × 4) ────────────────────────────────
 NUM_GPUS=4
-MAX_STEPS=100000
+MAX_STEPS=40000
 GLOBAL_BATCH_SIZE=512
 SAVE_STEPS=1000
 
@@ -56,7 +55,6 @@ docker run \
   --network host \
   --name ${CONTAINER_NAME} \
   -e WANDB_API_KEY \
-  -e WANDB_NAME \
   -e NCCL_TIMEOUT=3600 \
   -e TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600 \
   -v ${CODE_DIR}:/workspace/gr00t \
@@ -66,6 +64,7 @@ docker run \
   bash -lc '
     set -euo pipefail
     cd /workspace/gr00t
+    chmod -R 777 /checkpoints/GR00T-N1.6-no-physrepa || true
 
     torchrun --nproc_per_node='"${NUM_GPUS}"' --master_port=29501 \
       gr00t/experiment/launch_finetune.py \
@@ -83,6 +82,6 @@ docker run \
       --color_jitter_params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
       --dataloader_num_workers 4 \
       --save_steps '"${SAVE_STEPS}"' \
-      --save_total_limit 5 \
+      --save_total_limit 3 \
       --use_wandb
   '

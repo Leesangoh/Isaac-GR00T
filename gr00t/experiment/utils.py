@@ -53,6 +53,63 @@ class CheckpointFormatCallback(TrainerCallback):
                 shutil.copy2(wandb_config_src, wandb_config_dst)
 
 
+class ModelOnlyCheckpointCallback(TrainerCallback):
+    """Save model-only checkpoints (no optimizer/scheduler state) at every ``model_save_steps``
+    steps into a separate ``model-checkpoints/`` subdirectory under the output dir.
+
+    These are independent from the rolling full checkpoints managed by ``save_total_limit``,
+    so they are never deleted automatically.
+
+    When a full checkpoint coincides with a model-only step (i.e. step is a multiple of both
+    ``save_steps`` and ``model_save_steps``), the full checkpoint is protected from deletion
+    by being copied into the model-only directory as well.
+    """
+
+    def __init__(self, model_save_steps: int = 10000, exp_cfg_dir: Path | None = None):
+        self.model_save_steps = model_save_steps
+        self.exp_cfg_dir = exp_cfg_dir
+
+    def on_save(self, args, state, control, model=None, **kwargs):
+        step = state.global_step
+        if step % self.model_save_steps != 0:
+            return
+
+        if not state.is_world_process_zero:
+            return
+
+        output_dir = Path(args.output_dir)
+        model_ckpt_dir = output_dir / "model-checkpoints" / f"checkpoint-{step}"
+        model_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save model weights only using save_pretrained (works with DeepSpeed)
+        if model is not None:
+            unwrapped = model.module if hasattr(model, "module") else model
+            unwrapped.save_pretrained(model_ckpt_dir)
+        else:
+            # Fallback: copy non-optimizer files from full checkpoint
+            full_ckpt_dir = output_dir / f"checkpoint-{step}"
+            if full_ckpt_dir.exists():
+                skip_patterns = (
+                    "optimizer", "scheduler", "rng_state", "training_args",
+                    "zero_pp_rank", "optim_states", "global_step",
+                )
+                for item in full_ckpt_dir.iterdir():
+                    if any(p in item.name for p in skip_patterns):
+                        continue
+                    dst = model_ckpt_dir / item.name
+                    if item.is_dir():
+                        shutil.copytree(item, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, dst)
+
+        # Copy experiment config if available
+        if self.exp_cfg_dir is not None and self.exp_cfg_dir.exists():
+            exp_cfg_dst = model_ckpt_dir / self.exp_cfg_dir.name
+            shutil.copytree(self.exp_cfg_dir, exp_cfg_dst, dirs_exist_ok=True)
+
+        print(f"[ModelOnlyCheckpoint] Saved model-only checkpoint at step {step} to {model_ckpt_dir}")
+
+
 class BestMetricCheckpointCallback(TrainerCallback):
     """This callback saves the best checkpoint based on the metric."""
 
