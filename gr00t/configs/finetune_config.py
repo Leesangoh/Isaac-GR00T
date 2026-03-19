@@ -146,3 +146,9 @@ class FinetuneConfig:
     """If True, align each action token individually to its corresponding V-JEPA window
     (per-timestep alignment). If False, mean-pool all DiT tokens and align to a single
     V-JEPA feature (original behavior)."""
+
+    # --- DiT Reinitialization ---
+    reinit_dit: bool = False
+    """If True, reinitialize the DiT action head weights from scratch after loading
+    the pretrained checkpoint. VLM backbone remains pretrained. Useful for testing
+    whether PhysREPA helps when training DiT from random init."""

@@ -8,6 +8,7 @@ import warnings
 from omegaconf import OmegaConf
 import torch
 import torch.distributed as dist
+from torch import nn
 from transformers import TrainingArguments, set_seed
 import wandb
 
@@ -178,6 +179,23 @@ def run(config: Config, ft_config=None):
     data_collator = pipeline.return_collator()
     processor = pipeline.return_processor()
     processor.save_pretrained(processor_dir)
+
+    # DiT reinitialization (from scratch)
+    if ft_config is not None and getattr(ft_config, "reinit_dit", False):
+        logging.info("Reinitializing DiT action head weights from scratch...")
+        action_head = model.action_head
+        # Reinitialize DiT, state encoder, action encoder, and related modules
+        for module in [action_head.model, action_head.state_encoder, action_head.action_encoder]:
+            for name, param in module.named_parameters():
+                if param.dim() >= 2:
+                    nn.init.xavier_uniform_(param)
+                elif param.dim() == 1:
+                    nn.init.zeros_(param)
+        # Reinitialize mask_token if present
+        if hasattr(action_head, "mask_token") and action_head.mask_token is not None:
+            with torch.no_grad():
+                action_head.mask_token.data.copy_(0.02 * torch.randn_like(action_head.mask_token))
+        logging.info("DiT action head reinitialized. VLM backbone remains pretrained.")
 
     # PhysREPA setup
     physrepa_feature_loader = None
