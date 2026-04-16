@@ -151,6 +151,14 @@ def find_video_path(video_dir, ep_idx, video_key="observation.images.image_0"):
         if video_path.exists():
             return video_path
 
+    # Fallback: try chunk-000 (merged datasets may put all episodes in chunk-000)
+    if chunk_idx != 0:
+        chunk0_dir = video_dir / "chunk-000"
+        if chunk0_dir.exists():
+            video_path = chunk0_dir / video_key / ep_filename
+            if video_path.exists():
+                return video_path
+
     # Try flat layout
     video_path = video_dir / video_key / ep_filename
     if video_path.exists():
@@ -205,9 +213,10 @@ def load_video_frames(video_path, max_frames=None):
 
 
 def extract_features_for_episode(
-    model, frames, out_layers, window_size=16, window_stride=4, device="cuda"
+    model, frames, out_layers, window_size=16, window_stride=4, device="cuda",
+    batch_size=1,
 ):
-    """Extract V-JEPA 2 features for one episode using sliding windows."""
+    """Extract V-JEPA 2 features for one episode using sliding windows (batched)."""
     T = frames.shape[0]
     if T < window_size:
         pad = window_size - T
@@ -221,16 +230,26 @@ def extract_features_for_episode(
     results = {}
     results["window_starts"] = torch.tensor(window_starts, dtype=torch.int32)
 
-    for w_idx, start in enumerate(window_starts):
-        clip = frames[start : start + window_size]
-        clip = clip.permute(1, 0, 2, 3).unsqueeze(0).to(device)
+    # Process clips in batches for GPU throughput
+    for batch_start in range(0, len(window_starts), batch_size):
+        batch_end = min(batch_start + batch_size, len(window_starts))
+        batch_clips = []
+        for w_idx in range(batch_start, batch_end):
+            start = window_starts[w_idx]
+            clip = frames[start : start + window_size]
+            clip = clip.permute(1, 0, 2, 3)  # (C, T, H, W)
+            batch_clips.append(clip)
+
+        batch = torch.stack(batch_clips).to(device)  # (B, C, T, H, W)
 
         with torch.no_grad(), torch.amp.autocast("cuda"):
-            outputs = model(clip)
+            outputs = model(batch)
 
-        for layer_idx, layer_out in zip(out_layers, outputs):
-            pooled = layer_out.mean(dim=1).squeeze(0).half().cpu()
-            results[f"layer_{layer_idx}_window_{w_idx}"] = pooled
+        for b_offset in range(batch_end - batch_start):
+            w_idx = batch_start + b_offset
+            for layer_idx, layer_out in zip(out_layers, outputs):
+                pooled = layer_out[b_offset].mean(dim=0).half().cpu()
+                results[f"layer_{layer_idx}_window_{w_idx}"] = pooled
 
     return results
 
@@ -251,6 +270,7 @@ def main():
     parser.add_argument("--start_episode", type=int, default=0)
     parser.add_argument("--end_episode", type=int, default=-1)
     parser.add_argument("--video_key", type=str, default=None)
+    parser.add_argument("--batch_size", type=int, default=1, help="Clips per GPU batch (higher = faster, more VRAM)")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -310,7 +330,8 @@ def main():
         frames = torch.stack([normalize(f) for f in frames])
 
         results = extract_features_for_episode(
-            model, frames, args.out_layers, args.window_size, args.window_stride, device
+            model, frames, args.out_layers, args.window_size, args.window_stride, device,
+            batch_size=args.batch_size,
         )
 
         save_file(results, str(out_path))

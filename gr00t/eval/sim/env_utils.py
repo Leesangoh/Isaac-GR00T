@@ -29,4 +29,13 @@ def get_embodiment_tag_from_env_name(env_name: str) -> EmbodimentTag:
     if is_gr1_env(env_name):
         return EmbodimentTag.GR1
 
-    return EmbodimentTag(env_name.split("/")[0])
+    prefix = env_name.split("/")[0]
+    # SimplerEnv prefixes → EmbodimentTag mapping
+    simpler_mappings = {
+        "simpler_env_widowx": EmbodimentTag.OXE_WIDOWX,
+        "simpler_env_google": EmbodimentTag.OXE_GOOGLE,
+    }
+    if prefix in simpler_mappings:
+        return simpler_mappings[prefix]
+
+    return EmbodimentTag(prefix)
